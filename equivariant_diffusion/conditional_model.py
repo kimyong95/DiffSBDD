@@ -2,9 +2,10 @@ import math
 
 import numpy as np
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 from torch_scatter import scatter_add, scatter_mean
-
+from collections import defaultdict
 import utils
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion
 
@@ -138,15 +139,19 @@ class ConditionalDDPM(EnVariationalDiffusion):
         raise NotImplementedError("Has been replaced by sample_normal_zero_com()")
 
     def sample_normal_zero_com(self, mu_lig, xh0_pocket, sigma, lig_mask,
-                               pocket_mask, fix_noise=False):
+                               pocket_mask, fix_noise=False, given_noise=None):
         """Samples from a Normal distribution."""
         if fix_noise:
             # bs = 1 if fix_noise else mu.size(0)
             raise NotImplementedError("fix_noise option isn't implemented yet")
-
-        eps_lig = self.sample_gaussian(
-            size=(len(lig_mask), self.n_dims + self.atom_nf),
-            device=lig_mask.device)
+        
+        if given_noise is not None:
+            assert given_noise.shape == (len(lig_mask), self.n_dims + self.atom_nf)
+            eps_lig = given_noise
+        else:
+            eps_lig = self.sample_gaussian(
+                size=(len(lig_mask), self.n_dims + self.atom_nf),
+                device=lig_mask.device)
 
         out_lig = mu_lig + sigma[lig_mask] * eps_lig
 
@@ -361,7 +366,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
             
         return z_t_lig, xh_pocket, eps_t_lig
 
-    def diversify(self, ligand, pocket, noising_steps):
+    def diversify(self, ligand, pocket, noising_steps, given_noise_list=defaultdict(lambda: None)):
         """
         Diversifies a set of ligands via noise-denoising
         """
@@ -385,7 +390,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
 
-        for s in reversed(range(0, noising_steps)):
+        for i, s in enumerate(reversed(range(0, noising_steps))):
             s_array = torch.full((n_samples, 1), fill_value=s,
                                  device=z_lig.device)
             t_array = s_array + 1
@@ -393,7 +398,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
             t_array = t_array / timesteps
 
             z_lig, xh_pocket = self.sample_p_zs_given_zt(
-                s_array, t_array, z_lig.detach(), xh_pocket.detach(), lig_mask, pocket['mask'])
+                s_array, t_array, z_lig.detach(), xh_pocket.detach(), lig_mask, pocket['mask'], given_noise=given_noise_list[i])
 
         # Finally sample p(x, h | z_0).
         x_lig, h_lig, x_pocket, h_pocket = self.sample_p_xh_given_z0(
@@ -430,7 +435,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
         return zt_lig, xh0_pocket
 
     def sample_p_zs_given_zt(self, s, t, zt_lig, xh0_pocket, ligand_mask,
-                             pocket_mask, fix_noise=False):
+                             pocket_mask, fix_noise=False, given_noise=None):
         """Samples from zs ~ p(zs | zt). Only used during sampling."""
         gamma_s = self.gamma(s)
         gamma_t = self.gamma(t)
@@ -457,7 +462,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         # Sample zs given the parameters derived from zt.
         zs_lig, xh0_pocket = self.sample_normal_zero_com(
-            mu_lig, xh0_pocket, sigma, ligand_mask, pocket_mask, fix_noise)
+            mu_lig, xh0_pocket, sigma, ligand_mask, pocket_mask, fix_noise, given_noise=given_noise)
 
         self.assert_mean_zero_with_mask(zt_lig[:, :self.n_dims], ligand_mask)
 
@@ -477,7 +482,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
     @torch.no_grad()
     def sample_given_pocket(self, pocket, num_nodes_lig, return_frames=1,
-                            timesteps=None):
+                            timesteps=None, given_noise_list=defaultdict(lambda: None)):
         """
         Draw samples from the generative model. Optionally, return intermediate
         states for visualization purposes.
@@ -505,7 +510,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
         sigma = torch.ones_like(pocket['size']).unsqueeze(1)
 
         z_lig, xh_pocket = self.sample_normal_zero_com(
-            mu_lig, xh0_pocket, sigma, lig_mask, pocket['mask'])
+            mu_lig, xh0_pocket, sigma, lig_mask, pocket['mask'], given_noise=given_noise_list[0])
 
         self.assert_mean_zero_with_mask(z_lig[:, :self.n_dims], lig_mask)
 
@@ -515,7 +520,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
                                  device=device)
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
-        for s in reversed(range(0, timesteps)):
+        for i, s in tqdm(enumerate(reversed(range(0, timesteps))), desc="Sampling", total=timesteps):
             s_array = torch.full((n_samples, 1), fill_value=s,
                                  device=z_lig.device)
             t_array = s_array + 1
@@ -523,7 +528,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
             t_array = t_array / timesteps
 
             z_lig, xh_pocket = self.sample_p_zs_given_zt(
-                s_array, t_array, z_lig, xh_pocket, lig_mask, pocket['mask'])
+                s_array, t_array, z_lig, xh_pocket, lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
 
             # save frame
             if (s * return_frames) % timesteps == 0:
@@ -736,11 +741,11 @@ class SimpleConditionalDDPM(ConditionalDDPM):
 
     @torch.no_grad()
     def sample_given_pocket(self, pocket, num_nodes_lig, return_frames=1,
-                            timesteps=None):
+                            timesteps=None, given_noise=None):
 
         # Subtract pocket center of mass
         pocket_com = scatter_mean(pocket['x'], pocket['mask'], dim=0)
         pocket['x'] = pocket['x'] - pocket_com[pocket['mask']]
 
         return super(SimpleConditionalDDPM, self).sample_given_pocket(
-            pocket, num_nodes_lig, return_frames, timesteps)
+            pocket, num_nodes_lig, return_frames, timesteps, given_noise=given_noise)

@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 import wandb
 from torch_scatter import scatter_add, scatter_mean
 from Bio.PDB import PDBParser
-from Bio.PDB.Polypeptide import three_to_one
+from Bio.Data.PDBData import protein_letters_3to1
 
 from constants import dataset_params, FLOAT_TYPE, INT_TYPE
 from equivariant_diffusion.dynamics import EGNNDynamics
@@ -718,7 +718,7 @@ class LigandPocketDDPM(pl.LightningModule):
                 [res['CA'].get_coord() for res in biopython_residues]),
                 device=self.device, dtype=FLOAT_TYPE)
             pocket_types = torch.tensor(
-                [self.pocket_type_encoder[three_to_one(res.get_resname())]
+                [self.pocket_type_encoder[protein_letters_3to1(res.get_resname())]
                  for res in biopython_residues], device=self.device)
         else:
             pocket_atoms = [a for res in biopython_residues

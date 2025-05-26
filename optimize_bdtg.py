@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -9,8 +10,9 @@ from rdkit import Chem
 import pandas as pd
 import random
 import wandb
-from objective import Objective, METRIC_MAXIMIZE
 from collections import defaultdict
+from objective import Objective, METRIC_MAXIMIZE
+import einops
 from torch_scatter import scatter_mean
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
@@ -92,7 +94,7 @@ def prepare_substructure(ref_ligand, fix_atoms, pdb_model):
     return coord, one_hot
 
 
-def diversify_ligands(model, pocket, mols, timesteps,
+def generate_ligands(model, pocket, mols, given_noise_list,
                     sanitize=False,
                     largest_frag=False,
                     relax_iter=0):
@@ -103,7 +105,6 @@ def diversify_ligands(model, pocket, mols, timesteps,
         model: The model instance used for diversification.
         pocket: The pocket information including coordinates and types.
         mols: List of RDKit molecule objects to be diversified.
-        timesteps: Number of denoising steps to apply during diversification.
         sanitize: If True, performs molecule sanitization post-generation (default: False).
         largest_frag: If True, only the largest fragment of the generated molecule is returned (default: False).
         relax_iter: Number of iterations for force field relaxation of the generated molecules (default: 0).
@@ -111,7 +112,7 @@ def diversify_ligands(model, pocket, mols, timesteps,
     Returns:
         A list of diversified RDKit molecule objects.
     """
-
+    batch_size = len(mols)
     ligand = prepare_ligands_from_mols(mols, model.lig_type_encoder, device=model.device)
 
     pocket_mask = pocket['mask']
@@ -120,7 +121,7 @@ def diversify_ligands(model, pocket, mols, timesteps,
     # Pocket's center of mass
     pocket_com_before = scatter_mean(pocket['x'], pocket['mask'], dim=0)
 
-    out_lig, out_pocket, _, _ = model.ddpm.diversify(ligand, pocket, noising_steps=timesteps)
+    out_lig, out_pocket, _, _ = model.ddpm.sample_given_pocket(pocket, ligand["size"], given_noise_list=given_noise_list)
 
     # Move generated molecule back to the original pocket position
     pocket_com_after = scatter_mean(out_pocket[:, :model.x_dims], pocket_mask, dim=0)
@@ -146,9 +147,62 @@ def diversify_ligands(model, pocket, mols, timesteps,
                                largest_frag=largest_frag)
         if mol is not None:
             molecules.append(mol)
+        else:
+            molecules.append(None)
 
     return molecules
 
+def update_parameters(mu, sigma, noise, scores):
+    ''' minimize score '''
+
+    # noise: (T, B, D)
+    # scores: (T, B)
+
+    assert noise.shape[0] == scores.shape[0] == mu.shape[0] == sigma.shape[0]
+    assert noise.shape[1] == scores.shape[1]
+
+    T_dim = noise.shape[0]
+    B_dim = noise.shape[1]
+    D_dim = mu.shape[1]
+
+    lr_mu = math.sqrt(D_dim)
+    lr_sigma = 1
+    
+
+    mu = mu.clone()
+    sigma = sigma.clone()
+
+    for t in range(T_dim):
+        
+        scores_t = scores[t:].nanmean(0)
+        valid_mask = ~torch.isnan(scores_t)
+        scores_t = scores_t[valid_mask]
+        z_t = noise[t][valid_mask]
+        scores_t_normalized = (scores_t - scores_t.mean()) / (scores_t.std() + 1e-8)
+
+        w = torch.exp( - scores_t_normalized) / torch.exp( - scores_t_normalized).sum()
+
+        sigma[t] = 1 / (
+            
+            1/sigma[t] + lr_sigma / math.sqrt(D_dim) * (
+                (1/sigma[t])[None,:] * (z_t - mu[t,None,:]) * (z_t - mu[t,None,:]) * (1/sigma[t])[None,:] * \
+                
+                w[:,None]
+
+            # sum over N
+            ).sum(0)
+        )
+        
+        mu[t] = mu[t] - lr_mu / math.sqrt(D_dim) * (
+
+            (z_t - mu[t][None,:]) * \
+            
+            scores_t_normalized[:,None]
+        
+        # mean over N
+        ).mean(0)
+
+    return mu, sigma
 
 if __name__ == "__main__":
 
@@ -158,27 +212,23 @@ if __name__ == "__main__":
     parser.add_argument('--pocket_pdbfile', type=str, default='example/5ndu_pocket.pdb')
     parser.add_argument('--ref_ligand', type=str, default='example/5ndu_C_8V2.sdf')
     parser.add_argument('--objective', type=str, default='qed')
-    parser.add_argument('--timesteps', type=int, default=100)
-    parser.add_argument('--population_size', type=int, default=32)
-    parser.add_argument('--evolution_steps', type=int, default=300)
-    parser.add_argument('--top_k', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--optimization_steps', type=int, default=300)
     parser.add_argument('--outfile', type=Path, default='output.sdf')
     parser.add_argument('--relax', action='store_true')
-
 
     args = parser.parse_args()
 
     run = wandb.init(
         project="guide-sbdd",
-        name=f"evolutionary-{args.objective}",
+        name=f"bdtg-{args.objective}",
     )
 
     pdb_id = Path(args.pdbfile).stem
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    population_size = args.population_size
-    evolution_steps = args.evolution_steps
-    top_k = args.top_k
+    batch_size = args.batch_size
+    optimization_steps = args.optimization_steps
 
     # Load model
     model = LigandPocketDDPM.load_from_checkpoint(
@@ -190,73 +240,63 @@ if __name__ == "__main__":
     pdb_model = PDBParser(QUIET=True).get_structure('', args.pdbfile)[0]
     # Define pocket based on reference ligand
     residues = utils.get_pocket_from_ligand(pdb_model, args.ref_ligand)
-    pocket = model.prepare_pocket(residues, repeats=population_size)
+    pocket = model.prepare_pocket(residues, repeats=batch_size)
 
     metrics = args.objective.split(";")
     objective_fn = Objective(metrics, args.pocket_pdbfile)
 
     ref_mol = Chem.SDMolSupplier(args.ref_ligand)[0]
 
-    # Store molecules in history dataframe 
-    buffer = pd.DataFrame(columns=['generation', 'score', 'fate' 'mol', 'smiles'])
+    # guidance parameters
+    num_atoms = len(ref_mol.GetAtoms())
+    atom_dim = model.ddpm.n_dims + model.ddpm.atom_nf
+    mu = torch.zeros(model.ddpm.T+1, num_atoms * atom_dim, dtype=torch.float32).to(device)
+    sigma = torch.ones(model.ddpm.T+1, num_atoms * atom_dim, dtype=torch.float32).to(device)
 
-    # Population initialization
     ref_objective_value, _ = objective_fn([ref_mol])
-    
-    buffer_df = pd.DataFrame([{'generation': 0,
-        'score': -ref_objective_value.item(),  # Put negative because we want to maximize buffer[score]
-        'fate': 'initial', 'mol': ref_mol,
-        'smiles': Chem.MolToSmiles(ref_mol)}])
-    buffer = pd.concat([buffer, buffer_df], ignore_index=True)
+    print(f"Reference molecule objective value (lower better): {ref_objective_value[0]}")
 
-    print(f"Reference molecule objective value (lower better): {ref_objective_value}")
+    for optimization_idx in range(optimization_steps):
 
-    for generation_idx in range(evolution_steps):
-
-        if generation_idx == 0:
-            molecules = buffer['mol'].tolist() * population_size
-        else:
-            # Select top k molecules from previous generation
-            previous_gen = buffer[buffer['generation'] == generation_idx]
-            top_k_molecules = previous_gen.nlargest(top_k, 'score')['mol'].tolist()
-            molecules = top_k_molecules * (population_size // top_k)
-
-            # Update the fate of selected top k molecules in the buffer
-            buffer.loc[buffer['generation'] == generation_idx, 'fate'] = 'survived'
-
-            # Ensure the right number of molecules
-            if len(molecules) < population_size:
-                molecules += [random.choice(molecules) for _ in range(population_size - len(molecules))]
-
-
-        # Diversify molecules
-        assert len(molecules) == population_size, f"Wrong number of molecules: {len(molecules)} when it should be {population_size}"
-
-        molecules = diversify_ligands(model,
-                                    pocket,
-                                    molecules,
-                                timesteps=args.timesteps,
-                                sanitize=True,
-                                relax_iter=(200 if args.relax else 0))
+        batch_mu = einops.repeat(mu, 'T D -> T B D', B=batch_size)
+        batch_sigma = einops.repeat(sigma, 'T D -> T B D', B=batch_size)
+        batch_noise = batch_mu + batch_sigma**0.5 * torch.randn_like(batch_mu)
+        batch_noise_norm = batch_noise.norm(dim=-1)
+        batch_noise_projected = batch_noise / batch_noise_norm[:,:,None] * batch_noise_norm[:,:,None]
+        given_noise_list = einops.rearrange(batch_noise_projected, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
         
+        molecules = generate_ligands(
+            model,
+            pocket,
+            [ref_mol] * batch_size,
+            given_noise_list=given_noise_list,
+            sanitize=True,
+            relax_iter=(200 if args.relax else 0),
+        )
+        success_indices = []
+        success_molecules = []
+        for i, mol in enumerate(molecules):
+            if mol is not None:
+                success_indices.append(i)
+                success_molecules.append(mol)
+        batch_noise = batch_noise[:,success_indices,:]
         
         # Evaluate and save molecules
-        objective_values , metrics_breakdown = objective_fn(molecules)
-
-        for mol, obj_value in zip(molecules, objective_values):
-            buffer_df = pd.DataFrame([
-                {'generation': generation_idx + 1,
-                'score': -obj_value.item(), # Put negative because we want to maximize buffer[score]
-                'fate': 'purged', 'mol': mol,
-                'smiles': Chem.MolToSmiles(mol)}])
-            buffer = pd.concat([buffer, buffer_df], ignore_index=True)
+        objective_values = torch.zeros((model.ddpm.T+1, len(success_indices)), dtype=torch.float32).to(device)
+        objective_values_ , metrics_breakdown = objective_fn(success_molecules)
+        objective_values[:] = objective_values_
+            
+        # want to minimize objective_values
+        mu, sigma = update_parameters(mu, sigma, batch_noise, objective_values)
 
         # wandb log the score lower better
         log_dict = {
-            "train/score_mean": objective_values.mean(),
-            "train/score_best": objective_values.min(),
-            "step": generation_idx,
-            "train/feasible_mol_rate": len(molecules) / population_size,
+            "train/score_mean": objective_values[-1].mean(),
+            "train/score_best": objective_values[-1].min(),
+            "step": optimization_idx,
+            "train/feasible_mol_rate": len(success_indices) / batch_size,
+            "|mu|_2": mu.norm().item(),
+            "|sigma|_2": sigma.sum(-1).mean().item(),
         }
         for k, v in metrics_breakdown.items():
             log_dict[f"train/{k}_mean"] = torch.tensor(v).mean()
@@ -268,8 +308,3 @@ if __name__ == "__main__":
             log_dict[f"train/{k}_best"] = best
         wandb.log(log_dict)
 
-    # Make SDF files
-    utils.write_sdf_file(args.outfile, molecules)
-    # Save buffer
-    buffer.drop(columns=['mol'])
-    buffer.to_csv(args.outfile.with_suffix('.csv'))
