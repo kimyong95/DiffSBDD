@@ -868,6 +868,8 @@ class LigandPocketDDPM(pl.LightningModule):
                                    largest_frag=largest_frag)
             if mol is not None:
                 molecules.append(mol)
+            else:
+                molecules.append(None)
 
         return molecules
 

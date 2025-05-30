@@ -7,7 +7,7 @@ from objective import Objective, METRIC_MAXIMIZE
 import wandb
 from constants import FLOAT_TYPE, INT_TYPE
 import torch.nn.functional as F
-
+from utils import seed_everything
 import torch
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
@@ -107,18 +107,21 @@ if __name__ == "__main__":
     parser.add_argument('--all_frags', action='store_true')
     parser.add_argument('--sanitize', action='store_true')
     parser.add_argument('--relax', action='store_true')
+    parser.add_argument('--seed', type=int, default=0)
 
 
     args = parser.parse_args()
+    seed = args.seed
+    seed_everything(seed)
 
     run = wandb.init(
-        project="guide-sbdd",
-        name=f"bdtg-{args.objective}",
+        project=f"guide-sbdd",
+        name=f"bdtg-s{seed}-{args.objective}",
     )
 
     pdb_id = Path(args.pdbfile).stem
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cuda"
     
     # Load model
     model = LigandPocketDDPM.load_from_checkpoint(
@@ -136,29 +139,26 @@ if __name__ == "__main__":
     mu = torch.zeros(model.ddpm.T+1, num_atoms * atom_dim, dtype=torch.float32).to(device)
     sigma = torch.ones(model.ddpm.T+1, num_atoms * atom_dim, dtype=torch.float32).to(device)
     optimization_steps = args.optimization_steps
-
-
-    ref_ligand = prepare_ligands_from_mols([ref_mol], model.lig_type_encoder, device=model.device)
-    ref_ligand, _ = model.ddpm.normalize(ref_ligand, None)
-    ref_mu = torch.cat([ref_ligand['x'], ref_ligand['one_hot']], dim=1)
-    ref_mu[:,:model.ddpm.n_dims] -= ref_mu[:,:model.ddpm.n_dims].mean(0)
-    ref_mu = einops.rearrange(ref_mu, "M N -> (M N)" ,M=num_atoms, N=atom_dim)
+    generator = torch.Generator(device=device).manual_seed(seed)
 
     for optimization_idx in range(optimization_steps):
 
         batch_mu = einops.repeat(mu, 'T D -> T B D', B=batch_size)
         batch_sigma = einops.repeat(sigma, 'T D -> T B D', B=batch_size)
-        batch_noise = batch_mu + batch_sigma**0.5 * torch.randn_like(batch_mu)
+        batch_noise = batch_mu + batch_sigma**0.5 * torch.randn(batch_mu.size(), generator=generator, device=device)
         batch_noise_norm = batch_noise.norm(dim=-1)
         batch_noise_projected = batch_noise / batch_noise_norm[:,:,None] * batch_noise_norm[:,:,None]
         given_noise_list = einops.rearrange(batch_noise_projected, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
 
+        # given_noise_list = einops.rearrange(batch_noise, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
+
         molecules = model.generate_ligands(
-            args.pdbfile, args.batch_size, args.resi_list, args.ref_ligand,
+            args.pdbfile, batch_size, args.resi_list, args.ref_ligand,
             num_nodes_lig, args.sanitize, largest_frag=not args.all_frags,
             relax_iter=(200 if args.relax else 0),
             given_noise_list=given_noise_list,
         )
+        assert len(molecules) == batch_size
 
         success_indices = []
         success_molecules = []

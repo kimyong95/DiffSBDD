@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+from utils import seed_everything
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -164,18 +165,22 @@ if __name__ == "__main__":
     parser.add_argument('--top_k', type=int, default=4)
     parser.add_argument('--outfile', type=Path, default='output.sdf')
     parser.add_argument('--relax', action='store_true')
+    parser.add_argument('--seed', type=int, default=0)
 
 
     args = parser.parse_args()
+    seed = args.seed
+    seed_everything(seed)
 
     run = wandb.init(
         project="guide-sbdd",
-        name=f"evolutionary-{args.objective}",
+        name=f"evolutionary-s{seed}-{args.objective}",
     )
 
     pdb_id = Path(args.pdbfile).stem
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cuda"
+
     population_size = args.population_size
     evolution_steps = args.evolution_steps
     top_k = args.top_k

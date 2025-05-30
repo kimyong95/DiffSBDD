@@ -232,3 +232,24 @@ class AppendVirtualNodes:
         data['num_virtual_atoms'] = n_virt
 
         return data
+
+import random
+def seed_everything(seed_value):
+    """
+    Sets the seed for Python's random module, NumPy, and PyTorch (CPU and CUDA).
+
+    Args:
+        seed_value (int): The seed value to use.
+    """
+    random.seed(seed_value)  # Python's random module
+    np.random.seed(seed_value)  # NumPy
+    torch.manual_seed(seed_value)  # PyTorch CPU
+
+    # If you are using CUDA (GPU)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value)  # For multi-GPU setups
+        # Certain CUDA operations can still be non-deterministic.
+        # These settings help, but might impact performance.
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
