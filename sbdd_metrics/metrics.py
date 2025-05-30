@@ -4,8 +4,9 @@ import tempfile
 from abc import abstractmethod
 from collections import defaultdict
 from pathlib import Path
-from typing import Union, Dict, Collection, Set, Optional
+from typing import Union, Dict, Collection, Set, Optional, List
 import signal
+import asyncio
 import numpy as np
 import pandas as pd
 from unittest.mock import patch
@@ -72,22 +73,25 @@ class AbstractEvaluator:
         RDLogger.DisableLog('rdApp.*')
         self.check_format(molecule, protein)
 
-        # timeout handler
-        signal.signal(signal.SIGALRM, timeout_handler)
-        try:
-            signal.alarm(timeout)
-            results = self.evaluate(molecule, protein)
-        except TimeoutError:
-            print(f'Error when evaluating [{self.ID}]: Timeout after {timeout} seconds')
-            signal.alarm(0)
-            return {}
-        except Exception as e:
-            print(f'Error when evaluating [{self.ID}]: {e}')
-            signal.alarm(0)
-            return {}
-        finally:
-            signal.alarm(0)
+        results = self.evaluate(molecule, protein)
         return self.add_id(results)
+    
+        # # timeout handler
+        # signal.signal(signal.SIGALRM, timeout_handler)
+        # try:
+        #     signal.alarm(timeout)
+        #     results = self.evaluate(molecule, protein)
+        # except TimeoutError:
+        #     print(f'Error when evaluating [{self.ID}]: Timeout after {timeout} seconds')
+        #     signal.alarm(0)
+        #     return {}
+        # except Exception as e:
+        #     print(f'Error when evaluating [{self.ID}]: {e}')
+        #     signal.alarm(0)
+        #     return {}
+        # finally:
+        #     signal.alarm(0)
+        # return self.add_id(results)
 
     def add_id(self, results):
         if self.ID is not None:
@@ -98,7 +102,7 @@ class AbstractEvaluator:
     @abstractmethod
     def evaluate(self, molecule: Union[str, Path, Chem.Mol], protein: Union[str, Path]) -> Dict[str, Union[int, float, str]]:
         raise NotImplementedError
-    
+
     @staticmethod
     def check_format(molecule, protein):
         assert isinstance(molecule, (str, Path, Chem.Mol)), 'Supported molecule types: str, Path, Chem.Mol'
@@ -321,13 +325,15 @@ class InteractionsEvaluator(AbstractEvaluator):
 
 class GninaEvalulator(AbstractEvaluator):
     ID = 'gnina'
-    def __init__(self, gnina):
+    def __init__(self, gnina, vina_only=False):
         self.gnina = gnina
+        self.vina_only = vina_only
 
     def evaluate(self, molecule, protein=None):
         with tempfile.TemporaryDirectory() as tmpdir:
             molecule = self.save_molecule(molecule, sdf_path=Path(tmpdir, 'molecule.sdf'))
-            gnina_cmd = f'{self.gnina} -r {str(protein)} -l {str(molecule)} --minimize --seed 42'
+            vina_only_flag = "--cnn_scoring none" if self.vina_only else ""
+            gnina_cmd = f'{self.gnina} -r {str(protein)} -l {str(molecule)} --minimize --seed 42 {vina_only_flag}'
             gnina_result = subprocess.run(gnina_cmd, shell=True, capture_output=True, text=True)
             n_atoms = self.load_molecule(molecule).GetNumAtoms()
 
@@ -337,7 +343,7 @@ class GninaEvalulator(AbstractEvaluator):
         gnina_scores['vina_efficiency'] = gnina_scores['vina_score'] / n_atoms if n_atoms > 0 else None
         gnina_scores['gnina_efficiency'] = gnina_scores['gnina_score'] / n_atoms if n_atoms > 0 else None
         return gnina_scores
-    
+
     @staticmethod
     def read_gnina_results(gnina_result):
         res = {
@@ -726,6 +732,20 @@ class FullEvaluator(AbstractEvaluator):
         results = {}
         for evaluator in self.evaluators:
             results.update(evaluator(molecule, protein))
+        return results
+    
+    def evaluate_batch(self, molecules, proteins, max_concurrency=8):
+        loop = asyncio.get_event_loop()
+
+        semaphore = asyncio.Semaphore(max_concurrency)
+        async def evaluate_async(molecule, protein):
+            async with semaphore:
+                return await asyncio.to_thread(self.evaluate, molecule, protein)
+
+        tasks = [evaluate_async(m,p) for m,p in zip(molecules, proteins)]
+        tasks_future = asyncio.gather(*tasks)
+        results = loop.run_until_complete(tasks_future)
+
         return results
     
     @property

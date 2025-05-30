@@ -14,6 +14,11 @@ class Objective:
         exclude_evaluators = list(set([__e.ID for __e in FullEvaluator(gnina="gnina").evaluators]) - set([METRIC_EVALUATOR_MAP[met] for met in metrics]))
         self.evaluator = FullEvaluator(gnina="gnina", exclude_evaluators=exclude_evaluators)
         
+        if "vina" in metrics and "gnina" not in metrics:
+            for e in self.evaluator.evaluators:
+                if e.ID == "gnina":
+                    e.vina_only = True
+        
         self.metrics = metrics
         self.pocket_pdbfile = pocket_pdbfile
 
@@ -21,8 +26,8 @@ class Objective:
 
         objective_values = torch.zeros((len(molecules), len(self.metrics)))
         raw_values = torch.zeros((len(molecules), len(self.metrics)))
-        for i, mol in enumerate(molecules):
-            mol_result = self.evaluator.evaluate(mol, protein=self.pocket_pdbfile)
+        mol_results = self.evaluator.evaluate_batch(molecules, proteins=[self.pocket_pdbfile]*len(molecules))
+        for i, mol_result in enumerate(mol_results):
             for j, metric in enumerate(self.metrics):
                 obj_value, raw_value = self.process_result_metric(mol_result, metric)
                 objective_values[i, j] = obj_value
@@ -39,10 +44,15 @@ class Objective:
     # Ensure minimize the returned [objective_value]
     def process_result_metric(self, result, metric):
         if metric == "qed":
-            raw_value = result["medchem.qed"]
+            if not result["medchem.valid"]:
+                raw_value = 0.0
+            else:
+                raw_value = result["medchem.qed"]
         elif metric == "sa":
-            raw_value = result["medchem.sa"]
-            objective_value = raw_value
+            if not result["medchem.valid"]:
+                raw_value = 10.0
+            else:
+                raw_value = result["medchem.sa"]
         elif metric == "reos":
             reos_filters = ['reos.Glaxo', 'reos.Dundee', 'reos.BMS', 'reos.PAINS', 'reos.SureChEMBL', 'reos.MLSMR', 'reos.Inpharmatica', 'reos.LINT']
             raw_value = sum([float(result[obj]) for obj in reos_filters])

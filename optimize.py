@@ -160,7 +160,7 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, default='qed')
     parser.add_argument('--timesteps', type=int, default=100)
     parser.add_argument('--population_size', type=int, default=32)
-    parser.add_argument('--evolution_steps', type=int, default=300)
+    parser.add_argument('--evolution_steps', type=int, default=1000)
     parser.add_argument('--top_k', type=int, default=4)
     parser.add_argument('--outfile', type=Path, default='output.sdf')
     parser.add_argument('--relax', action='store_true')

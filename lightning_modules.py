@@ -837,7 +837,7 @@ class LigandPocketDDPM(pl.LightningModule):
         elif type(self.ddpm) == ConditionalDDPM:
             xh_lig, xh_pocket, lig_mask, pocket_mask = \
                 self.ddpm.sample_given_pocket(pocket, num_nodes_lig,
-                                              timesteps=timesteps)
+                                              timesteps=timesteps, **kwargs)
 
         else:
             raise NotImplementedError
