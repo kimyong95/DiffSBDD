@@ -839,7 +839,7 @@ class LigandPocketDDPM(pl.LightningModule):
                 self.ddpm.sample_given_pocket(pocket, num_nodes_lig,
                                               timesteps=timesteps, **kwargs)
         elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is not None:
-            xh_lig, xh_pocket, lig_mask, pocket_mask = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_t, **kwargs)
+            xh_lig, xh_pocket, lig_mask, pocket_mask = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_timestep, **kwargs)
         else:
             raise NotImplementedError
 
