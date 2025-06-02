@@ -149,6 +149,7 @@ if __name__ == "__main__":
     run = wandb.init(
         project="guide-sbdd",
         name=f"evolutionary-s{seed}-{args.objective}",
+        config=args,
     )
 
     pdb_id = Path(args.pdbfile).stem

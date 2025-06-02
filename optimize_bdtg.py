@@ -77,7 +77,7 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, default='qed')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--optimization_steps', type=int, default=1000)
-    parser.add_argument('--diversify_from_timestep', type=int, default=None, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand]")
+    parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand]")
 
     parser.add_argument('--resi_list', type=str, nargs='+', default=None)
     parser.add_argument('--all_frags', action='store_true')
@@ -93,6 +93,7 @@ if __name__ == "__main__":
     run = wandb.init(
         project=f"guide-sbdd",
         name=f"bdtg-s{seed}-{args.objective}",
+        config=args,
     )
 
     pdb_id = Path(args.pdbfile).stem
@@ -113,7 +114,7 @@ if __name__ == "__main__":
     metrics = args.objective.split(";")
     objective_fn = Objective(metrics, args.pocket_pdbfile)
 
-    num_parameters = model.ddpm.T+1 if args.diversify_from_t is None else args.diversify_from_t+1
+    num_parameters = model.ddpm.T+1 if args.diversify_from_timestep is None else args.diversify_from_timestep+1
     mu = torch.zeros(num_parameters, num_atoms * atom_dim, dtype=torch.float32).to(device)
     sigma = torch.ones(num_parameters, num_atoms * atom_dim, dtype=torch.float32).to(device)
     optimization_steps = args.optimization_steps
