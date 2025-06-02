@@ -752,9 +752,9 @@ class LigandPocketDDPM(pl.LightningModule):
         return pocket
 
     def generate_ligands(self, pdb_file, n_samples, pocket_ids=None,
-                         ref_ligand=None, num_nodes_lig=None, sanitize=False,
+                         ref_ligand_path=None, ref_ligand=None, num_nodes_lig=None, sanitize=False,
                          largest_frag=False, relax_iter=0, timesteps=None,
-                         n_nodes_bias=0, n_nodes_min=0, **kwargs):
+                         n_nodes_bias=0, n_nodes_min=0, diversify_from_timestep=None, **kwargs):
         """
         Generate ligands given a pocket
         Args:
@@ -778,7 +778,7 @@ class LigandPocketDDPM(pl.LightningModule):
             list of molecules
         """
 
-        assert (pocket_ids is None) ^ (ref_ligand is None)
+        assert (pocket_ids is None) ^ (ref_ligand_path is None)
 
         self.ddpm.eval()
 
@@ -792,7 +792,7 @@ class LigandPocketDDPM(pl.LightningModule):
 
         else:
             # define pocket with reference ligand
-            residues = utils.get_pocket_from_ligand(pdb_struct, ref_ligand)
+            residues = utils.get_pocket_from_ligand(pdb_struct, ref_ligand_path)
 
         pocket = self.prepare_pocket(residues, repeats=n_samples)
 
@@ -834,11 +834,12 @@ class LigandPocketDDPM(pl.LightningModule):
                 timesteps=timesteps, **kwargs)
 
         # Use conditional generation
-        elif type(self.ddpm) == ConditionalDDPM:
+        elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is None:
             xh_lig, xh_pocket, lig_mask, pocket_mask = \
                 self.ddpm.sample_given_pocket(pocket, num_nodes_lig,
                                               timesteps=timesteps, **kwargs)
-
+        elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is not None:
+            xh_lig, xh_pocket, lig_mask, pocket_mask = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_t, **kwargs)
         else:
             raise NotImplementedError
 

@@ -165,15 +165,19 @@ class ConditionalDDPM(EnVariationalDiffusion):
         return out_lig, xh_pocket
 
     def noised_representation(self, xh_lig, xh0_pocket, lig_mask, pocket_mask,
-                              gamma_t):
+                              gamma_t, given_noise=None):
         # Compute alpha_t and sigma_t from gamma.
         alpha_t = self.alpha(gamma_t, xh_lig)
         sigma_t = self.sigma(gamma_t, xh_lig)
 
         # Sample zt ~ Normal(alpha_t x, sigma_t)
-        eps_lig = self.sample_gaussian(
-            size=(len(lig_mask), self.n_dims + self.atom_nf),
-            device=lig_mask.device)
+        if given_noise is not None:
+            assert given_noise.shape == (len(lig_mask), self.n_dims + self.atom_nf)
+            eps_lig = given_noise
+        else:
+            eps_lig = self.sample_gaussian(
+                size=(len(lig_mask), self.n_dims + self.atom_nf),
+                device=lig_mask.device)
 
         # Sample z_t given x, h for timestep t, from q(z_t | x, h)
         z_t_lig = alpha_t[lig_mask] * xh_lig + sigma_t[lig_mask] * eps_lig
@@ -334,7 +338,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
                       t_int.squeeze(), xh_lig_hat)
         return (*loss_terms, info) if return_info else loss_terms
     
-    def partially_noised_ligand(self, ligand, pocket, noising_steps):
+    def partially_noised_ligand(self, ligand, pocket, noising_steps, given_noise=None):
         """
         Partially noises a ligand to be later denoised.
         """
@@ -362,7 +366,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
         # Find noised representation
         z_t_lig, xh_pocket, eps_t_lig = \
             self.noised_representation(xh0_lig, xh0_pocket, ligand['mask'],
-                                       pocket['mask'], gamma_t)
+                                       pocket['mask'], gamma_t, given_noise=given_noise)
             
         return z_t_lig, xh_pocket, eps_t_lig
 
@@ -374,7 +378,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
         # Normalize data, take into account volume change in x.
         ligand, pocket = self.normalize(ligand, pocket)
 
-        z_lig, xh_pocket, _ = self.partially_noised_ligand(ligand, pocket, noising_steps)
+        z_lig, xh_pocket, _ = self.partially_noised_ligand(ligand, pocket, noising_steps, given_noise=given_noise_list[0])
 
         timesteps = self.T
         n_samples = len(pocket['size'])
@@ -398,7 +402,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
             t_array = t_array / timesteps
 
             z_lig, xh_pocket = self.sample_p_zs_given_zt(
-                s_array, t_array, z_lig.detach(), xh_pocket.detach(), lig_mask, pocket['mask'], given_noise=given_noise_list[i])
+                s_array, t_array, z_lig.detach(), xh_pocket.detach(), lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
 
         # Finally sample p(x, h | z_0).
         x_lig, h_lig, x_pocket, h_pocket = self.sample_p_xh_given_z0(

@@ -8,11 +8,11 @@ import wandb
 from constants import FLOAT_TYPE, INT_TYPE
 import torch.nn.functional as F
 from utils import seed_everything
+import utils
 import torch
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
 
-import utils
 from lightning_modules import LigandPocketDDPM
 
 def update_parameters(mu, sigma, noise, scores):
@@ -67,31 +67,6 @@ def update_parameters(mu, sigma, noise, scores):
 
     return mu, sigma
 
-def prepare_ligands_from_mols(mols, atom_encoder, device='cpu'):
-
-    ligand_coords = []
-    atom_one_hots = []
-    masks = []
-    sizes = []
-    for i, mol in enumerate(mols):
-        coord = torch.tensor(mol.GetConformer().GetPositions(), dtype=FLOAT_TYPE)
-        types = torch.tensor([atom_encoder[a.GetSymbol()] for a in mol.GetAtoms()], dtype=INT_TYPE)
-        one_hot = F.one_hot(types, num_classes=len(atom_encoder))
-        mask = torch.ones(len(types), dtype=INT_TYPE) * i
-        ligand_coords.append(coord)
-        atom_one_hots.append(one_hot)
-        masks.append(mask)
-        sizes.append(len(types))
-
-    ligand = {
-        'x': torch.cat(ligand_coords, dim=0).to(device),
-        'one_hot': torch.cat(atom_one_hots, dim=0).to(device),
-        'size': torch.tensor(sizes, dtype=INT_TYPE).to(device),
-        'mask': torch.cat(masks, dim=0).to(device),
-    }
-
-    return ligand
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -102,6 +77,7 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, default='qed')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--optimization_steps', type=int, default=1000)
+    parser.add_argument('--diversify_from_timestep', type=int, default=None, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand]")
 
     parser.add_argument('--resi_list', type=str, nargs='+', default=None)
     parser.add_argument('--all_frags', action='store_true')
@@ -131,13 +107,15 @@ if __name__ == "__main__":
     batch_size = args.batch_size
     atom_dim = model.ddpm.n_dims + model.ddpm.atom_nf
     ref_mol = Chem.SDMolSupplier(args.ref_ligand)[0]
+    ref_ligand = utils.prepare_ligands_from_mols([ref_mol]*batch_size, model.lig_type_encoder, device=model.device)
     num_atoms = ref_mol.GetNumAtoms()
     num_nodes_lig = torch.ones(batch_size, dtype=int) * num_atoms
     metrics = args.objective.split(";")
     objective_fn = Objective(metrics, args.pocket_pdbfile)
 
-    mu = torch.zeros(model.ddpm.T+1, num_atoms * atom_dim, dtype=torch.float32).to(device)
-    sigma = torch.ones(model.ddpm.T+1, num_atoms * atom_dim, dtype=torch.float32).to(device)
+    num_parameters = model.ddpm.T+1 if args.diversify_from_t is None else args.diversify_from_t+1
+    mu = torch.zeros(num_parameters, num_atoms * atom_dim, dtype=torch.float32).to(device)
+    sigma = torch.ones(num_parameters, num_atoms * atom_dim, dtype=torch.float32).to(device)
     optimization_steps = args.optimization_steps
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -150,12 +128,11 @@ if __name__ == "__main__":
         batch_noise_projected = batch_noise / batch_noise_norm[:,:,None] * batch_noise_norm[:,:,None]
         given_noise_list = einops.rearrange(batch_noise_projected, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
 
-        # given_noise_list = einops.rearrange(batch_noise, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
-
         molecules = model.generate_ligands(
-            args.pdbfile, batch_size, args.resi_list, args.ref_ligand,
+            args.pdbfile, batch_size, args.resi_list, args.ref_ligand, ref_ligand,
             num_nodes_lig, args.sanitize, largest_frag=not args.all_frags,
             relax_iter=(200 if args.relax else 0),
+            diversify_from_timestep=args.diversify_from_timestep,
             given_noise_list=given_noise_list,
         )
         assert len(molecules) == batch_size
@@ -169,7 +146,7 @@ if __name__ == "__main__":
         batch_noise = batch_noise[:,success_indices,:]
         
         # Evaluate and save molecules
-        objective_values = torch.zeros((model.ddpm.T+1, len(success_indices)), dtype=torch.float32).to(device)
+        objective_values = torch.zeros((num_parameters, len(success_indices)), dtype=torch.float32).to(device)
         objective_values_ , metrics_breakdown = objective_fn(success_molecules)
         objective_values[:] = objective_values_
             

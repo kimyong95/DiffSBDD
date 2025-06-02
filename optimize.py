@@ -40,32 +40,6 @@ def prepare_from_sdf_files(sdf_files, atom_encoder):
     return torch.cat(ligand_coords, dim=0), torch.cat(atom_one_hot, dim=0)
 
 
-def prepare_ligands_from_mols(mols, atom_encoder, device='cpu'):
-
-    ligand_coords = []
-    atom_one_hots = []
-    masks = []
-    sizes = []
-    for i, mol in enumerate(mols):
-        coord = torch.tensor(mol.GetConformer().GetPositions(), dtype=FLOAT_TYPE)
-        types = torch.tensor([atom_encoder[a.GetSymbol()] for a in mol.GetAtoms()], dtype=INT_TYPE)
-        one_hot = F.one_hot(types, num_classes=len(atom_encoder))
-        mask = torch.ones(len(types), dtype=INT_TYPE) * i
-        ligand_coords.append(coord)
-        atom_one_hots.append(one_hot)
-        masks.append(mask)
-        sizes.append(len(types))
-
-    ligand = {
-        'x': torch.cat(ligand_coords, dim=0).to(device),
-        'one_hot': torch.cat(atom_one_hots, dim=0).to(device),
-        'size': torch.tensor(sizes, dtype=INT_TYPE).to(device),
-        'mask': torch.cat(masks, dim=0).to(device),
-    }
-
-    return ligand
-
-
 def prepare_ligand_from_pdb(biopython_atoms, atom_encoder):
 
     coord = torch.tensor(np.array([a.get_coord()
@@ -113,7 +87,7 @@ def diversify_ligands(model, pocket, mols, timesteps,
         A list of diversified RDKit molecule objects.
     """
 
-    ligand = prepare_ligands_from_mols(mols, model.lig_type_encoder, device=model.device)
+    ligand = utils.prepare_ligands_from_mols(mols, model.lig_type_encoder, device=model.device)
 
     pocket_mask = pocket['mask']
     lig_mask = ligand['mask']
