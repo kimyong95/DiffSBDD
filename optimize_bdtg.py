@@ -28,8 +28,8 @@ def update_parameters(mu, sigma, noise, scores):
     B_dim = noise.shape[1]
     D_dim = mu.shape[1]
 
-    lr_mu = math.sqrt(D_dim)
-    lr_sigma = 1
+    lr_mu = 1
+    lr_sigma = 1/128
     
 
     mu = mu.clone()
@@ -47,7 +47,7 @@ def update_parameters(mu, sigma, noise, scores):
 
         sigma[t] = 1 / (
             
-            1/sigma[t] + lr_sigma / math.sqrt(D_dim) * (
+            1/sigma[t] + lr_sigma * (
                 (1/sigma[t])[None,:] * (z_t - mu[t,None,:]) * (z_t - mu[t,None,:]) * (1/sigma[t])[None,:] * \
                 
                 w[:,None]
@@ -56,7 +56,7 @@ def update_parameters(mu, sigma, noise, scores):
             ).sum(0)
         )
         
-        mu[t] = mu[t] - lr_mu / math.sqrt(D_dim) * (
+        mu[t] = mu[t] - lr_mu * (
 
             (z_t - mu[t][None,:]) * \
             
@@ -77,7 +77,7 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, default='qed')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--optimization_steps', type=int, default=1000)
-    parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand]")
+    parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
 
     parser.add_argument('--resi_list', type=str, nargs='+', default=None)
     parser.add_argument('--all_frags', action='store_true')
@@ -89,6 +89,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     seed = args.seed
     seed_everything(seed)
+
+    if args.diversify_from_timestep == -1:
+        args.diversify_from_timestep = None
 
     run = wandb.init(
         project=f"guide-sbdd",
