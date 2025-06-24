@@ -10,10 +10,100 @@ import torch.nn.functional as F
 from utils import seed_everything
 import utils
 import torch
+import einops
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
 
 from lightning_modules import LigandPocketDDPM
+
+
+import gpytorch
+from torch import nn
+
+class ExactGpModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood, x_dim):
+        super(ExactGpModel, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=x_dim))
+        self.covar_module.base_kernel.lengthscale = (x_dim) ** 0.5
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+class ValueModel(nn.Module):
+    def __init__(self, dimension, noise_level = 1e-4) -> None:
+        super().__init__()
+        self.dim = dimension
+        self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+        self.likelihood.noise = noise_level
+        self.likelihood.eval()
+
+        model = ExactGpModel(None, None, self.likelihood, x_dim=dimension)
+
+        self.model = model
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+    def estimate_pseudo_target(self, x):
+        
+        device = x.device
+
+        if self.model.train_inputs == None or len(self.model.train_inputs) == 0:
+            return (x, torch.zeros_like(x, device=device))
+        
+        y_pred = []
+        y_grad = []
+
+        for xj in x:
+            with torch.enable_grad():
+                xj.requires_grad = True
+                yj = self.likelihood(self.model(xj.unsqueeze(0)))
+                grad = torch.autograd.grad(yj.mean, xj, create_graph=False, allow_unused=True)[0]
+                xj.requires_grad = False
+
+            y_pred.append(yj.mean.detach().cpu())
+            y_grad.append(grad.detach().cpu())
+
+        y_pred = torch.stack(y_pred).to(device)
+        y_grad = torch.stack(y_grad).to(device)
+        pseudo_direction = -y_grad
+        pseudo_target = x + pseudo_direction
+
+        return (pseudo_target, pseudo_direction)
+
+    def estimate_value(self, x):
+        device = x.device
+        y_mean = []
+        y_var = []
+        for xj in x:
+            yj = self.likelihood(self.model(xj.unsqueeze(0)))
+            y_mean.append(yj.mean.squeeze(0))
+            y_var.append(yj.variance.squeeze(0))
+
+        y_mean = torch.stack(y_mean).to(device)
+        y_var = torch.stack(y_var).to(device)
+
+        return y_mean, y_var
+
+    # x: data points
+    # y: lower is better
+    def add_model_data(self, x, y):
+        if self.model.train_inputs is not None and len(self.model.train_inputs) > 0:
+            x = torch.cat([self.model.train_inputs[0], x], dim=0)
+            y = torch.cat([self.model.train_targets, y], dim=0)
+
+        self.model.set_train_data(
+            inputs=x, 
+            targets=y,
+            strict=False,
+        )
+
+    def get_model_data(self):
+        return self.model.train_inputs[0], self.model.train_targets
+
 
 def update_parameters(mu, sigma, noise, scores):
     ''' minimize score '''
@@ -95,7 +185,7 @@ if __name__ == "__main__":
 
     run = wandb.init(
         project=f"guide-sbdd",
-        name=f"bdtg-s{seed}-{args.objective}",
+        name=f"bdtg-gp-s{seed}-{args.objective}",
         config=args,
     )
 
@@ -123,6 +213,11 @@ if __name__ == "__main__":
     optimization_steps = args.optimization_steps
     generator = torch.Generator(device=device).manual_seed(seed)
 
+    value_model = ValueModel(
+        dimension=num_atoms * atom_dim,
+    )
+    value_model.to(device)
+
     for optimization_idx in range(optimization_steps):
 
         batch_mu = einops.repeat(mu, 'T D -> T B D', B=batch_size)
@@ -132,7 +227,7 @@ if __name__ == "__main__":
         batch_noise_projected = batch_noise / batch_noise_norm[:,:,None] * batch_noise_norm[:,:,None]
         given_noise_list = einops.rearrange(batch_noise_projected, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
 
-        molecules = model.generate_ligands(
+        molecules, pred_z0_lig_traj = model.generate_ligands(
             args.pdbfile, batch_size, args.resi_list, args.ref_ligand, ref_ligand,
             num_nodes_lig, args.sanitize, largest_frag=not args.all_frags,
             relax_iter=(200 if args.relax else 0),
@@ -152,7 +247,21 @@ if __name__ == "__main__":
         # Evaluate and save molecules
         objective_values = torch.zeros((num_parameters, len(success_indices)), dtype=torch.float32).to(device)
         objective_values_ , metrics_breakdown = objective_fn(success_molecules)
-        objective_values[:] = objective_values_
+        
+        # objective_values[:] = objective_values_
+
+        x = einops.rearrange(
+            pred_z0_lig_traj[:,success_indices,:,:],
+            "T B M N -> T B (M N)",
+            M=num_atoms,
+            N=atom_dim
+        )
+        value_model.add_model_data(x[-1],objective_values_.to(device))
+
+        for i, xi in enumerate(x[:-1]):
+            estimated_values, variance = value_model.estimate_value(xi)
+            objective_values[i,:] = estimated_values
+        objective_values[-1] = objective_values_
             
         # want to minimize objective_values
         mu, sigma = update_parameters(mu, sigma, batch_noise, objective_values)

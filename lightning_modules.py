@@ -810,6 +810,8 @@ class LigandPocketDDPM(pl.LightningModule):
         # Apply minimum ligand size
         num_nodes_lig = torch.clamp(num_nodes_lig, min=n_nodes_min)
 
+        pred_z0_lig_traj = None
+
         # Use inpainting
         if type(self.ddpm) == EnVariationalDiffusion:
             lig_mask = utils.num_nodes_to_batch_mask(
@@ -832,14 +834,15 @@ class LigandPocketDDPM(pl.LightningModule):
             xh_lig, xh_pocket, lig_mask, pocket_mask = self.ddpm.inpaint(
                 ligand, pocket, lig_mask_fixed, pocket_mask_fixed,
                 timesteps=timesteps, **kwargs)
-
+    
         # Use conditional generation
         elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is None:
             xh_lig, xh_pocket, lig_mask, pocket_mask = \
                 self.ddpm.sample_given_pocket(pocket, num_nodes_lig,
                                               timesteps=timesteps, **kwargs)
         elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is not None:
-            xh_lig, xh_pocket, lig_mask, pocket_mask = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_timestep, **kwargs)
+            xh_lig, xh_pocket, lig_mask, pocket_mask, pred_z0_lig_traj = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_timestep, **kwargs)
+            pred_z0_lig_traj = torch.stack([ torch.stack(list(utils.batch_to_list(pred_z0_lig, lig_mask))) for pred_z0_lig in pred_z0_lig_traj ])
         else:
             raise NotImplementedError
 
@@ -872,7 +875,7 @@ class LigandPocketDDPM(pl.LightningModule):
             else:
                 molecules.append(None)
 
-        return molecules
+        return molecules, pred_z0_lig_traj
 
     def configure_gradient_clipping(self, optimizer, optimizer_idx,
                                     gradient_clip_val, gradient_clip_algorithm):

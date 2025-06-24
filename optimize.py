@@ -95,7 +95,7 @@ def diversify_ligands(model, pocket, mols, timesteps,
     # Pocket's center of mass
     pocket_com_before = scatter_mean(pocket['x'], pocket['mask'], dim=0)
 
-    out_lig, out_pocket, _, _ = model.ddpm.diversify(ligand, pocket, noising_steps=timesteps)
+    out_lig, out_pocket, _, _, _ = model.ddpm.diversify(ligand, pocket, noising_steps=timesteps)
 
     # Move generated molecule back to the original pocket position
     pocket_com_after = scatter_mean(out_pocket[:, :model.x_dims], pocket_mask, dim=0)

@@ -394,6 +394,8 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
 
+        pred_z0_lig_traj = []
+
         for i, s in enumerate(reversed(range(0, noising_steps))):
             s_array = torch.full((n_samples, 1), fill_value=s,
                                  device=z_lig.device)
@@ -401,8 +403,13 @@ class ConditionalDDPM(EnVariationalDiffusion):
             s_array = s_array / timesteps
             t_array = t_array / timesteps
 
-            z_lig, xh_pocket = self.sample_p_zs_given_zt(
+            z_lig, xh_pocket, pred_z0_lig = self.sample_p_zs_given_zt(
                 s_array, t_array, z_lig.detach(), xh_pocket.detach(), lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
+            
+            pred_z0_lig_traj.append(pred_z0_lig)
+
+        pred_z0_lig_traj.append(z_lig.detach())
+        pred_z0_lig_traj = torch.stack(pred_z0_lig_traj)
 
         # Finally sample p(x, h | z_0).
         x_lig, h_lig, x_pocket, h_pocket = self.sample_p_xh_given_z0(
@@ -415,7 +422,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
         out_pocket = torch.cat([x_pocket, h_pocket], dim=1)
 
         # remove frame dimension if only the final molecule is returned
-        return out_lig, out_pocket, lig_mask, pocket['mask']
+        return out_lig, out_pocket, lig_mask, pocket['mask'], pred_z0_lig_traj
 
 
     def xh_given_zt_and_epsilon(self, z_t, epsilon, gamma_t, batch_mask):
@@ -450,6 +457,8 @@ class ConditionalDDPM(EnVariationalDiffusion):
         sigma_s = self.sigma(gamma_s, target_tensor=zt_lig)
         sigma_t = self.sigma(gamma_t, target_tensor=zt_lig)
 
+        alpha_t = self.alpha(gamma_t, zt_lig)
+
         # Neural net prediction.
         eps_t_lig, _ = self.dynamics(
             zt_lig, xh0_pocket, t, ligand_mask, pocket_mask)
@@ -470,7 +479,9 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         self.assert_mean_zero_with_mask(zt_lig[:, :self.n_dims], ligand_mask)
 
-        return zs_lig, xh0_pocket
+        pred_z0_lig = (1 / alpha_t)[ligand_mask] * zt_lig - ( sigma_t / alpha_t)[ligand_mask] * eps_t_lig.detach()
+
+        return zs_lig, xh0_pocket, pred_z0_lig
 
     def sample_combined_position_feature_noise(self, lig_indices, xh0_pocket,
                                                pocket_indices):
@@ -531,7 +542,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
             s_array = s_array / timesteps
             t_array = t_array / timesteps
 
-            z_lig, xh_pocket = self.sample_p_zs_given_zt(
+            z_lig, xh_pocket, _ = self.sample_p_zs_given_zt(
                 s_array, t_array, z_lig, xh_pocket, lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
 
             # save frame
@@ -638,7 +649,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
                 gamma_s = self.gamma(s_array)
 
                 # sample inpainted part
-                z_lig_unknown, xh_pocket = self.sample_p_zs_given_zt(
+                z_lig_unknown, xh_pocket, _ = self.sample_p_zs_given_zt(
                     s_array, t_array, z_lig, xh_pocket, ligand['mask'],
                     pocket['mask'])
 
