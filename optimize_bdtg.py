@@ -11,6 +11,7 @@ from utils import seed_everything
 import utils
 import torch
 import einops
+from contextlib import contextmanager
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
 
@@ -24,7 +25,7 @@ class ExactGpModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, x_dim):
         super(ExactGpModel, self).__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims=x_dim))
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
         self.covar_module.base_kernel.lengthscale = (x_dim) ** 0.5
 
     def forward(self, x):
@@ -47,62 +48,54 @@ class ValueModel(nn.Module):
         self.model.eval()
         self.model.requires_grad_(False)
 
-    def estimate_pseudo_target(self, x):
-        
+    def predict(self, x):
         device = x.device
-
-        if self.model.train_inputs == None or len(self.model.train_inputs) == 0:
-            return (x, torch.zeros_like(x, device=device))
+        self.model.to(device)
+        self.likelihood.to(device)
         
-        y_pred = []
-        y_grad = []
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            y_preds = self.likelihood(self.model(x))
+        
+        y_preds_mean = y_preds.mean.to(device)
+        y_preds_var = y_preds.variance.to(device)
 
-        for xj in x:
-            with torch.enable_grad():
-                xj.requires_grad = True
-                yj = self.likelihood(self.model(xj.unsqueeze(0)))
-                grad = torch.autograd.grad(yj.mean, xj, create_graph=False, allow_unused=True)[0]
-                xj.requires_grad = False
-
-            y_pred.append(yj.mean.detach().cpu())
-            y_grad.append(grad.detach().cpu())
-
-        y_pred = torch.stack(y_pred).to(device)
-        y_grad = torch.stack(y_grad).to(device)
-        pseudo_direction = -y_grad
-        pseudo_target = x + pseudo_direction
-
-        return (pseudo_target, pseudo_direction)
-
-    def estimate_value(self, x):
-        device = x.device
-        y_mean = []
-        y_var = []
-        for xj in x:
-            yj = self.likelihood(self.model(xj.unsqueeze(0)))
-            y_mean.append(yj.mean.squeeze(0))
-            y_var.append(yj.variance.squeeze(0))
-
-        y_mean = torch.stack(y_mean).to(device)
-        y_var = torch.stack(y_var).to(device)
-
-        return y_mean, y_var
+        return y_preds_mean.to(device), y_preds_var.to(device)
 
     # x: data points
     # y: lower is better
     def add_model_data(self, x, y):
-        if self.model.train_inputs is not None and len(self.model.train_inputs) > 0:
-            x = torch.cat([self.model.train_inputs[0], x], dim=0)
-            y = torch.cat([self.model.train_targets, y], dim=0)
 
-        self.model.set_train_data(
-            inputs=x, 
-            targets=y,
-            strict=False,
-        )
+        if self.model.train_inputs is None:
+            self.model.set_train_data(inputs=x, targets=y, strict=False)
+
+        else:
+            self.model = self.model.get_fantasy_model(x, y)
 
     def get_model_data(self):
         return self.model.train_inputs[0], self.model.train_targets
+
+
+@contextmanager
+def model_device_context(model: nn.Module, device: str):
+    """
+    A context manager to temporarily move a model to a specified device.
+
+    Args:
+        model (nn.Module): The model to move.
+        device (str): The target device to move the model to (e.g., 'cuda', 'mps').
+    """
+    if 'cuda' in device and not torch.cuda.is_available():
+        device = 'cpu'
+        
+    original_device = next(model.parameters()).device
+    
+    try:
+        if original_device != device:
+            model.to(device)
+        yield
+    finally:
+        if next(model.parameters()).device != original_device:
+            model.to(original_device)
 
 
 def update_parameters(mu, sigma, noise, scores):
@@ -196,7 +189,6 @@ if __name__ == "__main__":
     # Load model
     model = LigandPocketDDPM.load_from_checkpoint(
         args.checkpoint, map_location=device)
-    model = model.to(device)
 
     batch_size = args.batch_size
     atom_dim = model.ddpm.n_dims + model.ddpm.atom_nf
@@ -206,17 +198,17 @@ if __name__ == "__main__":
     num_nodes_lig = torch.ones(batch_size, dtype=int) * num_atoms
     metrics = args.objective.split(";")
     objective_fn = Objective(metrics, args.pocket_pdbfile)
-
+    
+    dimension = num_atoms * atom_dim
     num_parameters = model.ddpm.T+1 if args.diversify_from_timestep is None else args.diversify_from_timestep+1
-    mu = torch.zeros(num_parameters, num_atoms * atom_dim, dtype=torch.float32).to(device)
-    sigma = torch.ones(num_parameters, num_atoms * atom_dim, dtype=torch.float32).to(device)
+    mu = torch.zeros(num_parameters, dimension, dtype=torch.float32).to(device)
+    sigma = torch.ones(num_parameters, dimension, dtype=torch.float32).to(device)
     optimization_steps = args.optimization_steps
     generator = torch.Generator(device=device).manual_seed(seed)
 
     value_model = ValueModel(
         dimension=num_atoms * atom_dim,
     )
-    value_model.to(device)
 
     for optimization_idx in range(optimization_steps):
 
@@ -227,13 +219,14 @@ if __name__ == "__main__":
         batch_noise_projected = batch_noise / batch_noise_norm[:,:,None] * batch_noise_norm[:,:,None]
         given_noise_list = einops.rearrange(batch_noise_projected, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
 
-        molecules, pred_z0_lig_traj = model.generate_ligands(
-            args.pdbfile, batch_size, args.resi_list, args.ref_ligand, ref_ligand,
-            num_nodes_lig, args.sanitize, largest_frag=not args.all_frags,
-            relax_iter=(200 if args.relax else 0),
-            diversify_from_timestep=args.diversify_from_timestep,
-            given_noise_list=given_noise_list,
-        )
+        with model_device_context(model, device):
+            molecules, pred_z0_lig_traj = model.generate_ligands(
+                args.pdbfile, batch_size, args.resi_list, args.ref_ligand, ref_ligand,
+                num_nodes_lig, args.sanitize, largest_frag=not args.all_frags,
+                relax_iter=(200 if args.relax else 0),
+                diversify_from_timestep=args.diversify_from_timestep,
+                given_noise_list=given_noise_list,
+            )
         assert len(molecules) == batch_size
 
         success_indices = []
@@ -246,7 +239,7 @@ if __name__ == "__main__":
         
         # Evaluate and save molecules
         objective_values = torch.zeros((num_parameters, len(success_indices)), dtype=torch.float32).to(device)
-        objective_values_ , metrics_breakdown = objective_fn(success_molecules)
+        objective_values_final , metrics_breakdown = objective_fn(success_molecules)
         
         # objective_values[:] = objective_values_
 
@@ -256,12 +249,13 @@ if __name__ == "__main__":
             M=num_atoms,
             N=atom_dim
         )
-        value_model.add_model_data(x[-1],objective_values_.to(device))
-
-        for i, xi in enumerate(x[:-1]):
-            estimated_values, variance = value_model.estimate_value(xi)
-            objective_values[i,:] = estimated_values
-        objective_values[-1] = objective_values_
+        
+        with model_device_context(value_model, device):
+            value_model.add_model_data(x[-1],objective_values_final.to(device))
+            for k, xk in enumerate(x[:-1]):
+                estimated_values, variance = value_model.predict(xk)
+                objective_values[k,:] = estimated_values
+            objective_values[-1] = objective_values_final
             
         # want to minimize objective_values
         mu, sigma = update_parameters(mu, sigma, batch_noise, objective_values)

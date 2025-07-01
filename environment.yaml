@@ -24,9 +24,18 @@ dependencies:
   - imageio=2.37
   - pip=24.0
   - einops=0.8.1
+  - gpytorch::gpytorch=1.11
+  - rclone
   - pip:
       - posebusters==0.3.1
       - useful_rdkit_utils==0.65
       - fcd==1.2.2
       - webdataset==0.2.86
       - prolif==2.0.3
+
+# After environment instation, please do the following manually: 
+# conda activate sbdd
+# wget https://github.com/gnina/gnina/releases/download/v1.3.1/
+# cp gnina1.3.1 $CONDA_PREFIX/bin/gnina
+# chmod +x $CONDA_PREFIX/bin/gnina
+# conda env config vars set LD_LIBRARY_PATH=$CONDA_PREFIX/lib
