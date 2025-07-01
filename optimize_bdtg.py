@@ -67,13 +67,15 @@ class ValueModel(nn.Module):
 
         if self.model.train_inputs is None:
             self.model.set_train_data(inputs=x, targets=y, strict=False)
-
         else:
-            self.model = self.model.get_fantasy_model(x, y)
+            self.model.set_train_data(
+                inputs=torch.cat([self.model.train_inputs[0], x], dim=0),
+                targets=torch.cat([self.model.train_targets, y], dim=0),
+                strict=False
+            )
 
     def get_model_data(self):
         return self.model.train_inputs[0], self.model.train_targets
-
 
 @contextmanager
 def model_device_context(model: nn.Module, device: str):
@@ -189,6 +191,7 @@ if __name__ == "__main__":
     # Load model
     model = LigandPocketDDPM.load_from_checkpoint(
         args.checkpoint, map_location=device)
+    model = model.to(device)
 
     batch_size = args.batch_size
     atom_dim = model.ddpm.n_dims + model.ddpm.atom_nf
@@ -200,7 +203,7 @@ if __name__ == "__main__":
     objective_fn = Objective(metrics, args.pocket_pdbfile)
     
     dimension = num_atoms * atom_dim
-    num_parameters = model.ddpm.T+1 if args.diversify_from_timestep is None else args.diversify_from_timestep+1
+    num_parameters = model.ddpm.T+2 if args.diversify_from_timestep is None else args.diversify_from_timestep+2
     mu = torch.zeros(num_parameters, dimension, dtype=torch.float32).to(device)
     sigma = torch.ones(num_parameters, dimension, dtype=torch.float32).to(device)
     optimization_steps = args.optimization_steps
@@ -209,6 +212,7 @@ if __name__ == "__main__":
     value_model = ValueModel(
         dimension=num_atoms * atom_dim,
     )
+    value_model.to(device)
 
     for optimization_idx in range(optimization_steps):
 
@@ -219,7 +223,7 @@ if __name__ == "__main__":
         batch_noise_projected = batch_noise / batch_noise_norm[:,:,None] * batch_noise_norm[:,:,None]
         given_noise_list = einops.rearrange(batch_noise_projected, 'T B (M N) -> T (B M) N', B=batch_size, M=num_atoms, N=atom_dim)
 
-        with model_device_context(model, device):
+        with torch.inference_mode():
             molecules, pred_z0_lig_traj = model.generate_ligands(
                 args.pdbfile, batch_size, args.resi_list, args.ref_ligand, ref_ligand,
                 num_nodes_lig, args.sanitize, largest_frag=not args.all_frags,
@@ -241,7 +245,7 @@ if __name__ == "__main__":
         objective_values = torch.zeros((num_parameters, len(success_indices)), dtype=torch.float32).to(device)
         objective_values_final , metrics_breakdown = objective_fn(success_molecules)
         
-        # objective_values[:] = objective_values_
+        # objective_values[:] = objective_values_final
 
         x = einops.rearrange(
             pred_z0_lig_traj[:,success_indices,:,:],
@@ -250,12 +254,11 @@ if __name__ == "__main__":
             N=atom_dim
         )
         
-        with model_device_context(value_model, device):
-            value_model.add_model_data(x[-1],objective_values_final.to(device))
-            for k, xk in enumerate(x[:-1]):
-                estimated_values, variance = value_model.predict(xk)
-                objective_values[k,:] = estimated_values
-            objective_values[-1] = objective_values_final
+        value_model.add_model_data(x[-1],objective_values_final.to(device))
+        for k, xk in enumerate(x[:-1]):
+            estimated_values, variance = value_model.predict(xk)
+            objective_values[k,:] = estimated_values
+        objective_values[-1] = objective_values_final
             
         # want to minimize objective_values
         mu, sigma = update_parameters(mu, sigma, batch_noise, objective_values)
