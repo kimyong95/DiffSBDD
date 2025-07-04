@@ -148,7 +148,7 @@ class ValueModel(nn.Module):
         self.model.requires_grad_(False)
 
         self.x_scaler = BaseScaler(dimension)
-        self.y_scaler = BaseScaler(1)
+        self.y_scaler = StandardScaler(1)
 
         self.all_data = {
             "x": torch.empty(0, dimension, dtype=torch.float32, device='cpu'),
@@ -163,7 +163,7 @@ class ValueModel(nn.Module):
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             y_preds = self.likelihood(self.model(self.x_scaler.transform(x)))
         
-        y_preds_mean = self.y_scaler.inverse_transform(y_preds.mean.to(device).unsqueeze(-1)).squeeze(-1)
+        y_preds_mean = self.y_scaler.inverse_transform(y_preds.mean.to(device))
         y_preds_var = y_preds.variance.to(device)
 
         return y_preds_mean.to(device), y_preds_var.to(device)
@@ -188,29 +188,6 @@ class ValueModel(nn.Module):
     def get_model_data(self):
         return self.all_data["x"], self.all_data["y"]
 
-@contextmanager
-def model_device_context(model: nn.Module, device: str):
-    """
-    A context manager to temporarily move a model to a specified device.
-
-    Args:
-        model (nn.Module): The model to move.
-        device (str): The target device to move the model to (e.g., 'cuda', 'mps').
-    """
-    if 'cuda' in device and not torch.cuda.is_available():
-        device = 'cpu'
-        
-    original_device = next(model.parameters()).device
-    
-    try:
-        if original_device != device:
-            model.to(device)
-        yield
-    finally:
-        if next(model.parameters()).device != original_device:
-            model.to(original_device)
-
-
 def update_parameters(mu, sigma, noise, scores):
     ''' minimize score '''
 
@@ -233,20 +210,19 @@ def update_parameters(mu, sigma, noise, scores):
 
     for t in range(T_dim):
         
-        scores_t = scores[t:].nanmean(0)
-        valid_mask = ~torch.isnan(scores_t)
-        scores_t = scores_t[valid_mask]
-        z_t = noise[t][valid_mask]
-        scores_t_normalized = (scores_t - scores_t.mean()) / (scores_t.std() + 1e-8)
+        scores_t = scores[t:].mean(0)
+        z_t = noise[t]
+        scores_t_normalized = (scores_t - scores_t.mean()) / scores_t.std().clamp(min=1e-8)
+        
+        scores_t_softmaxed = nn.Softmax(dim=0)(-scores_t_normalized)
 
-        w = torch.exp( - scores_t_normalized) / torch.exp( - scores_t_normalized).sum()
 
         sigma[t] = 1 / (
             
             1/sigma[t] + lr_sigma * (
                 (1/sigma[t])[None,:] * (z_t - mu[t,None,:]) * (z_t - mu[t,None,:]) * (1/sigma[t])[None,:] * \
                 
-                w[:,None]
+                scores_t_softmaxed[:,None]
 
             # sum over N
             ).sum(0)

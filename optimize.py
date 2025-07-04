@@ -212,12 +212,13 @@ if __name__ == "__main__":
         # Diversify molecules
         assert len(molecules) == population_size, f"Wrong number of molecules: {len(molecules)} when it should be {population_size}"
 
-        molecules = diversify_ligands(model,
-                                    pocket,
-                                    molecules,
-                                timesteps=args.timesteps,
-                                sanitize=True,
-                                relax_iter=(200 if args.relax else 0))
+        with torch.inference_mode():
+            molecules = diversify_ligands(model,
+                                        pocket,
+                                        molecules,
+                                    timesteps=args.timesteps,
+                                    sanitize=True,
+                                    relax_iter=(200 if args.relax else 0))
         
         
         # Evaluate and save molecules

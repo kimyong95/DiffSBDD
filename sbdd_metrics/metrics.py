@@ -734,7 +734,7 @@ class FullEvaluator(AbstractEvaluator):
             results.update(evaluator(molecule, protein))
         return results
     
-    def evaluate_batch(self, molecules, proteins, max_concurrency=8):
+    def evaluate_batch(self, molecules, proteins, max_concurrency=4):
         loop = asyncio.get_event_loop()
 
         semaphore = asyncio.Semaphore(max_concurrency)
