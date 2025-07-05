@@ -333,7 +333,7 @@ class GninaEvalulator(AbstractEvaluator):
         with tempfile.TemporaryDirectory() as tmpdir:
             molecule = self.save_molecule(molecule, sdf_path=Path(tmpdir, 'molecule.sdf'))
             vina_only_flag = "--cnn_scoring none" if self.vina_only else ""
-            gnina_cmd = f'{self.gnina} -r {str(protein)} -l {str(molecule)} --minimize --seed 42 {vina_only_flag}'
+            gnina_cmd = f'{self.gnina} -r {str(protein)} -l {str(molecule)} --minimize --cpu 1 --seed 42 {vina_only_flag}'
             gnina_result = subprocess.run(gnina_cmd, shell=True, capture_output=True, text=True)
             n_atoms = self.load_molecule(molecule).GetNumAtoms()
 
@@ -734,7 +734,7 @@ class FullEvaluator(AbstractEvaluator):
             results.update(evaluator(molecule, protein))
         return results
     
-    def evaluate_batch(self, molecules, proteins, max_concurrency=4):
+    def evaluate_batch(self, molecules, proteins, max_concurrency=8):
         loop = asyncio.get_event_loop()
 
         semaphore = asyncio.Semaphore(max_concurrency)

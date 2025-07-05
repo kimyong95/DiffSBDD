@@ -155,16 +155,17 @@ class ValueModel(nn.Module):
             "y": torch.empty(0, dtype=torch.float32, device='cpu')
         }
 
+    @torch.no_grad()
     def predict(self, x):
         device = x.device
         self.model.to(device)
         self.likelihood.to(device)
         
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            y_preds = self.likelihood(self.model(self.x_scaler.transform(x)))
+        y_preds = self.likelihood(self.model(self.x_scaler.transform(x)))
         
         y_preds_mean = self.y_scaler.inverse_transform(y_preds.mean.to(device))
         y_preds_var = y_preds.variance.to(device)
+        torch.cuda.empty_cache()
 
         return y_preds_mean.to(device), y_preds_var.to(device)
 
@@ -270,8 +271,6 @@ if __name__ == "__main__":
         name=f"bdtg-gp-s{seed}-{args.objective}",
         config=args,
     )
-
-    
 
     pdb_id = Path(args.pdbfile).stem
 
