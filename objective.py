@@ -44,12 +44,12 @@ class Objective:
     # Ensure minimize the returned [objective_value]
     def process_result_metric(self, result, metric):
         if metric == "qed":
-            if not result["medchem.valid"]:
+            if not result["medchem.valid"] or result["medchem.qed"] is None:
                 raw_value = 0.0
             else:
                 raw_value = result["medchem.qed"]
         elif metric == "sa":
-            if not result["medchem.valid"]:
+            if not result["medchem.valid"] or result["medchem.sa"] is None:
                 raw_value = 10.0
             else:
                 raw_value = result["medchem.sa"]

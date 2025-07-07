@@ -18,6 +18,11 @@ openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
 
 from lightning_modules import LigandPocketDDPM
 
+#################### reserve fixed 3 GB memory for Gnina ######################
+reserve_bytes = 3 * (1024**3)
+reserve_fraction = reserve_bytes / torch.cuda.get_device_properties(0).total_memory
+torch.cuda.set_per_process_memory_fraction(reserve_fraction, torch.cuda.current_device())
+###############################################################################
 
 import gpytorch
 from torch import nn
@@ -161,11 +166,11 @@ class ValueModel(nn.Module):
         self.model.to(device)
         self.likelihood.to(device)
         
-        y_preds = self.likelihood(self.model(self.x_scaler.transform(x)))
+        with gpytorch.settings.fast_pred_var():
+            y_preds = self.likelihood(self.model(self.x_scaler.transform(x)))
         
         y_preds_mean = self.y_scaler.inverse_transform(y_preds.mean.to(device))
         y_preds_var = y_preds.variance.to(device)
-        torch.cuda.empty_cache()
 
         return y_preds_mean.to(device), y_preds_var.to(device)
 
