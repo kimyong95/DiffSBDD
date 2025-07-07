@@ -484,7 +484,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         self.assert_mean_zero_with_mask(zt_lig[:, :self.n_dims], ligand_mask)
 
-        pred_z0_lig = 1. / alpha_t[ligand_mask] * (zt_lig - sigma_t[ligand_mask] * eps_t_lig.detach())
+        pred_z0_lig = self.compute_x_pred(eps_t_lig, zt_lig, gamma_t, ligand_mask)
 
         pred_z0_lig[:, :self.n_dims], _ = self.remove_mean_batch(pred_z0_lig[:, :self.n_dims], xh0_pocket[:, :self.n_dims], ligand_mask, pocket_mask)
 
