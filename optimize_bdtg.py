@@ -155,10 +155,8 @@ class ValueModel(nn.Module):
         self.x_scaler = BaseScaler(dimension)
         self.y_scaler = StandardScaler(1)
 
-        self.all_data = {
-            "x": torch.empty(0, dimension, dtype=torch.float32, device='cpu'),
-            "y": torch.empty(0, dtype=torch.float32, device='cpu')
-        }
+        self.register_buffer("all_x", torch.empty(0, dimension, dtype=torch.float32))
+        self.register_buffer("all_y", torch.empty(0, dtype=torch.float32))
 
     @torch.no_grad()
     def predict(self, x):
@@ -179,15 +177,17 @@ class ValueModel(nn.Module):
     def add_model_data(self, x, y):
         device = x.device
 
-        self.all_data["x"] = torch.cat([self.all_data["x"], x.cpu()], dim=0)
-        self.all_data["y"] = torch.cat([self.all_data["y"], y.cpu()], dim=0)
+        MAX_SAMPLES = 2000
 
-        self.x_scaler.fit(self.all_data["x"])
-        self.y_scaler.fit(self.all_data["y"])
+        self.all_x = torch.cat([self.all_x, x], dim=0)[-MAX_SAMPLES:]
+        self.all_y = torch.cat([self.all_y, y], dim=0)[-MAX_SAMPLES:]
+
+        self.x_scaler.fit(self.all_x)
+        self.y_scaler.fit(self.all_y)
         
         self.model.set_train_data(
-            inputs=self.x_scaler.transform(self.all_data['x']).to(device),
-            targets=self.y_scaler.transform(self.all_data['y']).to(device),
+            inputs=self.x_scaler.transform(self.all_x),
+            targets=self.y_scaler.transform(self.all_y),
             strict=False
         )
 
