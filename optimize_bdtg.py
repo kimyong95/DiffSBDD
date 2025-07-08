@@ -25,7 +25,7 @@ torch.cuda.set_per_process_memory_fraction(reserve_fraction, torch.cuda.current_
 ###############################################################################
 
 from torch import nn
-from gp import ValueModel
+from value_model import ValueModel
 
 def update_parameters(mu, sigma, noise, scores):
     ''' minimize score '''
