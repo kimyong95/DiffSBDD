@@ -1,4 +1,3 @@
-
 from sbdd_metrics.metrics import FullEvaluator
 from typing import List
 from collections import defaultdict
@@ -7,6 +6,13 @@ METRIC_EVALUATOR_MAP = { "qed": "medchem", "sa": "medchem", "reos": "reos", "vin
 
 # True means maximize
 METRIC_MAXIMIZE = { "qed": True, "sa": False, "reos": True, "vina": False, "gnina": True }
+
+METRIC_RANGE = {
+    "qed": (0.0, 1.0),
+    "sa": (1.0, 10.0),
+    "vina": (-12.0, 0.0),
+    "gnina": (-10.0, 0.0),
+}
 
 class Objective:
 
@@ -26,7 +32,11 @@ class Objective:
 
         objective_values = torch.zeros((len(molecules), len(self.metrics)))
         raw_values = torch.zeros((len(molecules), len(self.metrics)))
-        mol_results = self.evaluator.evaluate_batch(molecules, proteins=[self.pocket_pdbfile]*len(molecules))
+        
+        mol_results = []
+        for molecule in molecules:
+            mol_results.append(self.evaluator.evaluate(molecule, protein=self.pocket_pdbfile))
+
         for i, mol_result in enumerate(mol_results):
             for j, metric in enumerate(self.metrics):
                 obj_value, raw_value = self.process_result_metric(mol_result, metric)
@@ -68,4 +78,3 @@ class Objective:
 
         return objective_value, raw_value
 
-            
