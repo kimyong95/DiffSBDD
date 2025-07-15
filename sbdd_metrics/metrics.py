@@ -1,14 +1,16 @@
-import multiprocessing
+from functools import wraps
+import time
 import subprocess
 import tempfile
+import numpy as np
+import pandas as pd
+import multiprocessing
+import signal
+import asyncio
 from abc import abstractmethod
 from collections import defaultdict
 from pathlib import Path
 from typing import Union, Dict, Collection, Set, Optional, List
-import signal
-import asyncio
-import numpy as np
-import pandas as pd
 from unittest.mock import patch
 from scipy.spatial.distance import jensenshannon
 from fcd import get_fcd
@@ -26,6 +28,28 @@ from .sascorer import calculateScore
 
 def timeout_handler(signum, frame):
     raise TimeoutError('Timeout')
+
+
+def retry(tries=4, delay=3, backoff=2):
+    """
+    Retry decorator with exponential backoff.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            mtries, mdelay = tries, delay
+            while mtries > 1:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    print(f"'{func.__name__}' failed with '{e}'. Retrying in {mdelay} seconds...")
+                    time.sleep(mdelay)
+                    mtries -= 1
+                    mdelay *= backoff
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
 
 BOND_SYMBOLS = {
     Chem.rdchem.BondType.SINGLE: '-',
@@ -329,6 +353,7 @@ class GninaEvalulator(AbstractEvaluator):
         self.gnina = gnina
         self.vina_only = vina_only
 
+    @retry()
     def evaluate(self, molecule, protein=None):
         with tempfile.TemporaryDirectory() as tmpdir:
             molecule = self.save_molecule(molecule, sdf_path=Path(tmpdir, 'molecule.sdf'))

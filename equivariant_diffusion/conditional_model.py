@@ -424,7 +424,6 @@ class ConditionalDDPM(EnVariationalDiffusion):
         out_lig = torch.cat([x_lig, h_lig], dim=1)
         out_pocket = torch.cat([x_pocket, h_pocket], dim=1)
         pred_z0_lig_traj = torch.stack(pred_z0_lig_traj, dim=0)
-        pred_z0_lig_traj[:,:,self.n_dims:] = F.one_hot(torch.argmax(pred_z0_lig_traj[:,:,self.n_dims:], dim=-1), self.atom_nf).to(torch.float32)
 
         # remove frame dimension if only the final molecule is returned
         return out_lig, out_pocket, lig_mask, pocket['mask'], pred_z0_lig_traj
