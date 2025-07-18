@@ -169,7 +169,8 @@ if __name__ == "__main__":
         
         # Evaluate and save molecules
         objective_values = torch.zeros((num_parameters, len(success_indices)), dtype=torch.float32).to(device)
-        objective_values_final , metrics_breakdown = objective_fn(success_molecules)
+        metrics_breakdown, objective_values_final  = objective_fn(success_molecules)
+        objective_values_final = objective_values_final.sum(1)
         
         # objective_values[:] = objective_values_final
 

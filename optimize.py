@@ -181,7 +181,8 @@ if __name__ == "__main__":
     buffer = pd.DataFrame(columns=['generation', 'score', 'fate' 'mol', 'smiles'])
 
     # Population initialization
-    ref_objective_value, _ = objective_fn([ref_mol])
+    _, ref_objective_value = objective_fn([ref_mol])
+    ref_objective_value = ref_objective_value.sum(1)
     
     buffer_df = pd.DataFrame([{'generation': 0,
         'score': -ref_objective_value.item(),  # Put negative because we want to maximize buffer[score]
@@ -222,7 +223,8 @@ if __name__ == "__main__":
         
         
         # Evaluate and save molecules
-        objective_values , metrics_breakdown = objective_fn(molecules)
+        metrics_breakdown, objective_values = objective_fn(molecules)
+        objective_values = objective_values.sum(1)
 
         for mol, obj_value in zip(molecules, objective_values):
             buffer_df = pd.DataFrame([

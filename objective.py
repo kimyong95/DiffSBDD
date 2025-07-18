@@ -11,7 +11,7 @@ METRIC_RANGE = {
     "qed": (0.0, 1.0),
     "sa": (1.0, 10.0),
     "vina": (-12.0, 0.0),
-    "gnina": (-10.0, 0.0),
+    "gnina": (0, 10.0),
 }
 
 class Objective:
@@ -28,31 +28,43 @@ class Objective:
         self.metrics = metrics
         self.pocket_pdbfile = pocket_pdbfile
 
+        self.objectives_consumption = 0
+
+    # Input: list of molecules
+    # Output:
+    # - metrics_breakdown: a dictionary with metric names as keys and raw values as lists
+    # - normalized_objective_values: tensor of (N, K), lower is better, roughly in [0, 1] range
     def __call__(self, molecules):
 
-        objective_values = torch.zeros((len(molecules), len(self.metrics)))
         raw_values = torch.zeros((len(molecules), len(self.metrics)))
+        normalized_objective_values = torch.zeros((len(molecules), len(self.metrics)))
         
-        mol_results = []
-        for molecule in molecules:
-            mol_results.append(self.evaluator.evaluate(molecule, protein=self.pocket_pdbfile))
+        # mol_results = []
+        # for molecule in molecules:
+        #     mol_results.append(self.evaluator.evaluate(molecule, protein=self.pocket_pdbfile))
+
+        mol_results = self.evaluator.evaluate_batch(molecules, proteins=[self.pocket_pdbfile]*len(molecules))
 
         for i, mol_result in enumerate(mol_results):
             for j, metric in enumerate(self.metrics):
-                obj_value, raw_value = self.process_result_metric(mol_result, metric)
-                objective_values[i, j] = obj_value
+                raw_value, normalized_obj_value = self.get_objective_values(mol_result, metric)
                 raw_values[i, j] = raw_value
-
-        objective_values = objective_values.sum(dim=1)
+                normalized_objective_values[i, j] = normalized_obj_value
+        
         metrics_breakdown = {
             metric_name: raw_values[:, i].tolist()
             for i, metric_name in enumerate(self.metrics)
         }
 
-        return objective_values, metrics_breakdown
+        self.objectives_consumption += len(molecules)
+
+        return metrics_breakdown, normalized_objective_values
     
-    # Ensure minimize the returned [objective_value]
-    def process_result_metric(self, result, metric):
+    # Input: raw metric value (could be None)
+    # Output:
+    # - raw_value: the raw metric value
+    # - normalized_objective_value: scale the objective_value to roughly [0, 1] range, lower is better
+    def get_objective_values(self, result, metric):
         if metric == "qed":
             if not result["medchem.valid"] or result["medchem.qed"] is None:
                 raw_value = 0.0
@@ -73,8 +85,12 @@ class Objective:
         else:
             raise ValueError(f"Metric {metric} not recognized.")
         
-        sign = {True: -1, False: +1}
-        objective_value = sign[METRIC_MAXIMIZE[metric]] * raw_value
+        if METRIC_MAXIMIZE[metric]:
+            min_value, max_value = METRIC_RANGE[metric]
+            normalized_objective_value = (min_value - raw_value) / (max_value - min_value)
+        else:
+            min_value, max_value = METRIC_RANGE[metric]
+            normalized_objective_value = (raw_value - max_value) / (max_value - min_value)
 
-        return objective_value, raw_value
+        return raw_value, normalized_objective_value
 

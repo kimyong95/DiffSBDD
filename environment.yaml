@@ -16,6 +16,8 @@ dependencies:
   - openbabel=3.1.1
   - biopython=1.83
   - scipy=1.12.0
+  - numpy
+  - pymoo
   - pyg=2.5.1
   - pytorch-scatter=2.1.2
   - ProDy=2.4.0
