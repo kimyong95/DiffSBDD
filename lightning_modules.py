@@ -754,7 +754,7 @@ class LigandPocketDDPM(pl.LightningModule):
     def generate_ligands(self, pdb_file, n_samples, pocket_ids=None,
                          ref_ligand_path=None, ref_ligand=None, num_nodes_lig=None, sanitize=False,
                          largest_frag=False, relax_iter=0, timesteps=None,
-                         n_nodes_bias=0, n_nodes_min=0, diversify_from_timestep=None, **kwargs):
+                         n_nodes_bias=0, n_nodes_min=0, diversify_from_timestep=None, callback=None, **kwargs):
         """
         Generate ligands given a pocket
         Args:
@@ -839,9 +839,9 @@ class LigandPocketDDPM(pl.LightningModule):
         elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is None:
             xh_lig, xh_pocket, lig_mask, pocket_mask = \
                 self.ddpm.sample_given_pocket(pocket, num_nodes_lig,
-                                              timesteps=timesteps, **kwargs)
+                                              timesteps=timesteps, callback=callback, **kwargs)
         elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is not None:
-            xh_lig, xh_pocket, lig_mask, pocket_mask, pred_z0_lig_traj = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_timestep, **kwargs)
+            xh_lig, xh_pocket, lig_mask, pocket_mask, pred_z0_lig_traj = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_timestep, callback=callback, **kwargs)
             pred_z0_lig_traj = torch.stack([ torch.stack(list(utils.batch_to_list(pred_z0_lig, lig_mask))) for pred_z0_lig in pred_z0_lig_traj ])
         else:
             raise NotImplementedError

@@ -372,7 +372,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
             
         return z_t_lig, xh_pocket, eps_t_lig
 
-    def diversify(self, ligand, pocket, noising_steps, given_noise_list=defaultdict(lambda: None)):
+    def diversify(self, ligand, pocket, noising_steps, given_noise_list=defaultdict(lambda: None), callback=None):
         """
         Diversifies a set of ligands via noise-denoising
         """
@@ -407,6 +407,12 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
             z_lig, xh_pocket, pred_z0_lig = self.sample_p_zs_given_zt(
                 s_array, t_array, z_lig.detach(), xh_pocket.detach(), lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
+
+            if callback is not None and s > 0:
+                next_s = s - 1
+                callback_out = callback(pred_z0_lig=pred_z0_lig, s=next_s, lig_mask=lig_mask, pocket=pocket, xh_pocket=xh_pocket)
+                z_lig = callback_out["z_lig"] if "z_lig" in callback_out else z_lig
+                xh_pocket = callback_out["xh_pocket"] if "xh_pocket" in callback_out else xh_pocket
 
             pred_z0_lig_traj.append(pred_z0_lig)
 
@@ -503,7 +509,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
     @torch.no_grad()
     def sample_given_pocket(self, pocket, num_nodes_lig, return_frames=1,
-                            timesteps=None, given_noise_list=defaultdict(lambda: None)):
+                            timesteps=None, given_noise_list=defaultdict(lambda: None), callback=None):
         """
         Draw samples from the generative model. Optionally, return intermediate
         states for visualization purposes.
@@ -548,8 +554,14 @@ class ConditionalDDPM(EnVariationalDiffusion):
             s_array = s_array / timesteps
             t_array = t_array / timesteps
 
-            z_lig, xh_pocket, _ = self.sample_p_zs_given_zt(
+            z_lig, xh_pocket, pred_z0_lig = self.sample_p_zs_given_zt(
                 s_array, t_array, z_lig, xh_pocket, lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
+
+            if callback is not None and s > 0:
+                next_s = s-1
+                callback_out = callback(pred_z0_lig=pred_z0_lig, s=next_s, lig_mask=lig_mask, pocket=pocket, xh_pocket=xh_pocket)
+                z_lig = callback_out["z_lig"] if "z_lig" in callback_out else z_lig
+                xh_pocket = callback_out["xh_pocket"] if "xh_pocket" in callback_out else xh_pocket
 
             # save frame
             if (s * return_frames) % timesteps == 0:
@@ -558,7 +570,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
                     self.unnormalize_z(z_lig, xh_pocket)
 
         # Finally sample p(x, h | z_0).
-        x_lig, h_lig, x_pocket, h_pocket = self.sample_p_xh_given_z0(
+        x_lig, h_lig, x_pocket, h_pocket, _ = self.sample_p_xh_given_z0(
             z_lig, xh_pocket, lig_mask, pocket['mask'], n_samples)
 
         self.assert_mean_zero_with_mask(x_lig, lig_mask)
