@@ -19,10 +19,12 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from typing import List
-from pymoo.indicators.hv import HV
+from utils_moo import EvaluatedMolecule, log_molecules_objective_values
 from rdkit import Chem
-from rdkit.DataStructs import BulkTanimotoSimilarity
+
 from rdkit.Chem import AllChem
+from scipy.stats import qmc
+from scipy.special import gammaincinv
 
 from torch_scatter import scatter_mean
 from lightning_modules import LigandPocketDDPM
@@ -37,151 +39,32 @@ torch.cuda.set_per_process_memory_fraction(reserve_fraction, torch.cuda.current_
 from torch import nn
 from value_model import ValueModel
 
-def generate_systematic_weights(k: int, H: int) -> torch.Tensor:
-    """
-    Generates a uniform, grid-like set of weight vectors.
+def is_number(s):
+  """
+  Checks if a string is a number, including negatives and decimals.
+  """
+  try:
+    float(s) # Use float() to handle both integers and decimals
+    return True
+  except ValueError:
+    return False
 
-    This function implements the systematic approach by Das and Dennis to create
-    structured weights for multi-objective optimization.
+def aggregate_objectives(multi_objective_values, shift_constants, weight_lambda):
+    """
+    Aggregate multi-objective values using a specified function.
 
     Args:
-        k (int): The number of objectives (dimension of the vectors).
-        H (int): The number of divisions for the grid. Must be a positive integer.
+        multi_objective_values (torch.Tensor):
+            A tensor of shape (N, K) where N is the number of points and K is the number of objectives.
+            Lower is better.
 
     Returns:
-        torch.Tensor: A tensor of shape (N, k) containing the weight vectors,
-                      where N = C(H + k - 1, k - 1). Each vector sums to 1.0.
+        torch.Tensor: A tensor of aggregated values.
     """
-    # 1. Input validation
-    if not isinstance(k, int) or k <= 0 or not isinstance(H, int) or H <= 0:
-        raise ValueError("Both k (objectives) and H (divisions) must be positive integers.")
-
-    # 2. Recursive helper to find all lists of 'k' integers that sum to 'H'
-    def _find_combinations(dim: int, total: int):
-        # Base case: last dimension takes the remainder of the sum
-        if dim == 1:
-            yield [total]
-            return
-        
-        # Recursive step: iterate through possible values for the current dimension
-        for i in range(total + 1):
-            for combo in _find_combinations(dim - 1, total - i):
-                yield [i] + combo
-
-    # 3. Generate integer combinations and convert to a tensor
-    # The .flip() arranges the weights in a more intuitive descending order
-    combinations = list(_find_combinations(k, H))
-    weights = torch.tensor(combinations, dtype=torch.float32).flip(dims=(1,))
-
-    # 4. Normalize by H to ensure the elements in each vector sum to 1
-    return weights / H
-
-def calculate_hypervolume(points):
-    """
-    Calculate hypervolume for multi-objective optimization using pymoo's HV indicator.
     
-    Args:
-        points: N x K tensor of objective values (lower is better)
-    
-    Returns:
-        hypervolume: Scalar hypervolume value
-    """
-    # pymoo's HV indicator assumes a minimization problem.
-    # We convert our maximization problem to minimization by negating the points.
-    points = points.cpu().numpy()
-    n_points, n_dims = points.shape
-    
-    if n_points == 0:
-        return 0.0
-    
-    # For the converted minimization problem, the reference point must be larger
-    # than all point coordinates. Since original points are >= 0, a zero vector is a suitable ref point.
-    reference_point = np.zeros(n_dims)
-    hv_indicator = HV(ref_point=reference_point)
-    hypervolume = hv_indicator(points)
-    
-    return hypervolume
+    aggregated_objective_value = - torch.logsumexp( - (multi_objective_values - shift_constants[None,:]) / weight_lambda, dim=1 )
 
-
-def calculate_molecules_diversity(molecules: List[Chem.Mol]) -> float:
-    """
-    Calculates the internal molecules of a list of molecules, ensuring they are
-    sanitized before fingerprinting.
-
-    Args:
-        molecules: A list of RDKit Mol objects.
-
-    Returns:
-        A diversity score between 0.0 (all identical) and 1.0 (highly diverse).
-    """
-    valid_mols = [m for m in molecules if m is not None]
-
-    if len(valid_mols) < 2:
-        return 0.0
-
-    # --- NEW: Sanitize molecules before fingerprinting ---
-    sanitized_mols = []
-    for mol in valid_mols:
-        try:
-            # This is the crucial step that fixes the error.
-            Chem.SanitizeMol(mol)
-            sanitized_mols.append(mol)
-        except Chem.rdchem.MolSanitizeException:
-            # Optionally, you can log or print a warning here.
-            # print("Warning: A molecule failed sanitization and will be skipped.")
-            pass # Skip molecules that cannot be sanitized
-
-    # If few molecules survive sanitization, diversity is low.
-    if len(sanitized_mols) < 2:
-        return 0.0
-
-    # 1. Generate Morgan fingerprints from the *sanitized* molecules
-    try:
-        fingerprints = [AllChem.GetMorganFingerprintAsBitVect(m, 2, nBits=2048) for m in sanitized_mols]
-    except RuntimeError:
-        # This is a fallback in case sanitization passes but fingerprinting still fails.
-        return 0.0
-        
-    # 2. Calculate similarities for all unique pairs
-    unique_similarities = []
-    for i in range(len(fingerprints)):
-        sims = BulkTanimotoSimilarity(fingerprints[i], fingerprints[i+1:])
-        unique_similarities.extend(sims)
-    
-    if not unique_similarities:
-        return 0.0
-
-    # 3. Calculate the final diversity score
-    average_similarity = np.mean(unique_similarities)
-    diversity = 1.0 - average_similarity
-    
-    return diversity
-
-def get_pareto_front(objective_values):
-    """
-    Computes the Pareto front from a set of multi-objective values.
-
-    Args:
-        objective_values (torch.Tensor): A tensor of shape (N, K) where N is the
-                                         number of points and K is the number of
-                                         objectives. Assumes lower values are better.
-
-    Returns:
-        torch.Tensor: A tensor containing the points on the Pareto front.
-    """
-    if objective_values.numel() == 0:
-        return torch.empty(0, objective_values.shape[1], device=objective_values.device, dtype=objective_values.dtype)
-
-    is_pareto = torch.ones(objective_values.shape[0], dtype=torch.bool, device=objective_values.device)
-    for i in range(objective_values.shape[0]):
-        # A point is on the Pareto front if no other point dominates it.
-        # A point `j` dominates point `i` if `j` is better or equal in all objectives
-        # and strictly better in at least one.
-        dominators = (objective_values <= objective_values[i]).all(dim=1) & (objective_values < objective_values[i]).any(dim=1)
-        if dominators.any():
-            is_pareto[i] = False
-            
-    return objective_values[is_pareto]
+    return aggregated_objective_value
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -194,12 +77,13 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--sub_batch_size', type=int, default=4, help="Sub-batch size for sampling, should be smaller than batch_size.") 
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
-    parser.add_argument('--baseline', action='store_true', help="Use baseline sampling without selection mechanism.")
     parser.add_argument('--resi_list', type=str, nargs='+', default=None)
     parser.add_argument('--all_frags', action='store_true')
     parser.add_argument('--sanitize', action='store_true')
     parser.add_argument('--relax', action='store_true')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--shift_constants', type=str, default="best")
+    parser.add_argument('--lambda_normalization', type=str, default="l2")
 
 
     args = parser.parse_args()
@@ -209,11 +93,9 @@ if __name__ == "__main__":
     if args.diversify_from_timestep == -1:
         args.diversify_from_timestep = None
 
-    baseline_str = "-(baseline)" if args.baseline else ""
-
     run = wandb.init(
-        project=f"guide-sbdd",
-        name=f"sample-and-select{baseline_str}-s={seed}-{args.objective}",
+        project=f"sbdd-multi-objective",
+        name=f"sample-and-select-s={seed}-c={args.shift_constants}-{args.lambda_normalization}-{args.objective}",
         config=args,
     )
 
@@ -239,11 +121,27 @@ if __name__ == "__main__":
     
     dimension = num_atoms * atom_dim
 
-    concentration = torch.ones(num_objectives)
-    dirichlet_dist = torch.distributions.Dirichlet(concentration)
-    weights = dirichlet_dist.sample(sample_shape=(batch_size,)).to(device)
-
     generator = torch.Generator(device=device).manual_seed(seed)
+    
+    torch.manual_seed(seed)
+
+    shift_constants = torch.zeros((num_objectives,), dtype=torch.float32, device=device)
+    if is_number(args.shift_constants):
+        shift_constants[:] = float(args.shift_constants)
+    elif args.shift_constants == "best":
+        shift_constants[:] = float('inf')
+    elif args.shift_constants == "worst":
+        shift_constants[:] = float('-inf')
+    elif args.shift_constants == "mean":
+        shift_constants[:] = 0.0
+    else:
+        raise ValueError(f"Unknown shift_constants: {args.shift_constants}")
+    
+    lambda_ = torch.randn((batch_size, num_objectives), device=device, generator=generator).abs()
+    if args.lambda_normalization == "l2":
+        lambda_ = lambda_ / lambda_.norm(dim=1, p=2, keepdim=True)
+    elif args.lambda_normalization == "l1":
+        lambda_ = lambda_ / lambda_.norm(dim=1, p=1, keepdim=True)
 
     @torch.inference_mode()
     def callback_func(pred_z0_lig, s, lig_mask, pocket, xh_pocket):
@@ -357,59 +255,51 @@ if __name__ == "__main__":
         )
 
         # [successful_objective_values] lower is better
-        metrics_breakdown, successful_objective_values = objective_fn(success_molecules)
+        successful_raw_metrics, successful_objective_values = objective_fn(success_molecules)
         multi_objective_values[success_indices, :] = successful_objective_values.to(device)
+        raw_metrics = [None] * len(molecules)
+        for i, m in zip(success_indices, successful_raw_metrics):
+            raw_metrics[i] = m
+
+        if args.shift_constants == "best":                
+            shift_constants[:] = torch.minimum(shift_constants, multi_objective_values.min(dim=0).values)
+        elif args.shift_constants == "worst":
+            shift_constants[:] = torch.maximum(shift_constants, multi_objective_values.max(dim=0).values)
+        elif args.shift_constants == "mean":
+            shift_constants[:] = multi_objective_values.mean(dim=0)
 
         select_indices = []
         select_lig_mask = []
         select_pocket_mask = []
-        selected_multi_objective_values_list = []
+        multi_objective_values_candidates = multi_objective_values.clone()
         for i in range(batch_size):
-            weight_i = weights[i][None,:]
-            aggregated_objective_values = (multi_objective_values * weight_i).sum(1)
+            lambda_i = lambda_[i, :]
+            aggregated_objective_values = aggregate_objectives(multi_objective_values_candidates, shift_constants, lambda_i)
             select_index = aggregated_objective_values.argmin().item()
-            selected_multi_objective_values_list.append(multi_objective_values[select_index].clone())
-            multi_objective_values[select_index, :] = float('inf')  # Mark as used
+            multi_objective_values_candidates[select_index, :] = float('inf')  # Mark as used
 
             select_indices.append(select_index)
             select_lig_mask.append( (new_lig_mask == select_index).nonzero().squeeze(1) )
             select_pocket_mask.append( (new_pocket_mask == select_index).nonzero().squeeze(1) )
-        
+        del multi_objective_values_candidates
         select_lig_mask = torch.stack(select_lig_mask).flatten()
         select_pocket_mask = torch.stack(select_pocket_mask).flatten()
 
         final_zs_lig = zs_lig[select_lig_mask]
         final_zs_pocket = expanded_xh_pocket[select_pocket_mask]
 
-        selected_molecules = [ molecules[i] for i in select_indices ]
-        molecules_diversity = calculate_molecules_diversity(selected_molecules)
+        selected_molecules = [
+            EvaluatedMolecule(molecules[i], multi_objective_values[i], successful_raw_metrics[i])
+            for i in select_indices
+        ]
 
-        selected_multi_objective_values = torch.stack(selected_multi_objective_values_list)
+        log_molecules_objective_values(
+            selected_molecules, 
+            objectives_feedbacks=objective_fn.objectives_consumption,
+            stage=f"intermediate",
+        )
 
-        hypervolume = calculate_hypervolume(selected_multi_objective_values)
-        pareto_front = get_pareto_front(selected_multi_objective_values)
-
-        log_dict = {
-            "intermediate/hypervolume": hypervolume,
-            "intermediate/number_of_pareto": len(pareto_front),
-            "intermediate/feasible_mol_rate": len(success_indices) / (batch_size * sub_batch_size),
-            "intermediate/diversity": molecules_diversity,
-            "objectives_feedbacks": objective_fn.objectives_consumption,
-        }
-
-        for k, v in metrics_breakdown.items():
-            log_dict[f"intermediate/{k}_mean"] = torch.tensor(v).mean()
-            if METRIC_MAXIMIZE[k]:
-                best = torch.tensor(v).max()
-            else:
-                best = torch.tensor(v).min()
-            log_dict[f"intermediate/{k}_best"] = best
-        wandb.log(log_dict)
-
-        if args.baseline:
-            return {}
-        else:
-            return {"z_lig": final_zs_lig, "xh_pocket": final_zs_pocket}
+        return {"z_lig": final_zs_lig, "xh_pocket": final_zs_pocket}
 
     with torch.inference_mode():
         molecules, pred_z0_lig_traj = model.generate_ligands(
@@ -429,42 +319,15 @@ if __name__ == "__main__":
             success_molecules.append(mol)
 
     # [objective_values] lower is better
-    metrics_breakdown, objective_values = objective_fn(success_molecules)
-    molecules_diversity = calculate_molecules_diversity(success_molecules)
+    raw_metrics, objective_values = objective_fn(success_molecules)
+    selected_molecules = [
+        EvaluatedMolecule(mol, obj_values, raw_metric)
+        for mol, obj_values, raw_metric in zip(success_molecules, objective_values, raw_metrics)
+    ]
 
-
-
-    # Plot objectives and calculate hypervolume
-    hypervolume = calculate_hypervolume(objective_values)
-    pareto_front = get_pareto_front(objective_values)
-
-    # Log final pareto front
-    objective_names = list(metrics_breakdown.keys())
-    for i in range(num_objectives):
-        for j in range(i + 1, num_objectives):
-            plot_data = pareto_front[:, [i, j]].cpu().numpy()
-            table = wandb.Table(data=plot_data, columns=[objective_names[i], objective_names[j]])
-            log_payload = {
-                f"final/pareto_front/{objective_names[i]}_vs_{objective_names[j]}": wandb.plot.scatter(
-                    table, objective_names[i], objective_names[j],
-                    title=f"Pareto Front: {objective_names[i]} vs {objective_names[j]}"
-                )
-            }
-            wandb.log(log_payload, commit=False)
-
-    # wandb log the score lower better (final log)
-    log_dict = {
-        "final/hypervolume": hypervolume,
-        "final/feasible_mol_rate": len(success_indices) / batch_size,
-        "final/diversity": molecules_diversity,
-        "objectives_feedbacks": objective_fn.objectives_consumption,
-        "final/number_of_pareto": len(pareto_front),
-    }
-    for k, v in metrics_breakdown.items():
-        log_dict[f"final/{k}_mean"] = torch.tensor(v).mean()
-        if METRIC_MAXIMIZE[k]:
-            best = torch.tensor(v).max()
-        else:
-            best = torch.tensor(v).min()
-        log_dict[f"final/{k}_best"] = best
-    wandb.log(log_dict)
+    
+    log_molecules_objective_values(
+        selected_molecules, 
+        objectives_feedbacks=objective_fn.objectives_consumption,
+        stage=f"final",
+    )

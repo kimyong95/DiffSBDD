@@ -12,6 +12,7 @@ import utils
 import torch
 from tqdm import tqdm
 import einops
+import pandas as pd
 from contextlib import contextmanager
 from openbabel import openbabel
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
@@ -169,9 +170,10 @@ if __name__ == "__main__":
         
         # Evaluate and save molecules
         objective_values = torch.zeros((num_parameters, len(success_indices)), dtype=torch.float32).to(device)
-        metrics_breakdown, objective_values_final  = objective_fn(success_molecules)
+        raw_metrics, objective_values_final  = objective_fn(success_molecules)
         objective_values_final = objective_values_final.sum(1)
-        
+        raw_metrics_inv = pd.DataFrame(raw_metrics).to_dict('list')
+
         # objective_values[:] = objective_values_final
 
         x = einops.rearrange(
@@ -199,12 +201,8 @@ if __name__ == "__main__":
             "|mu|_2": mu.norm().item(),
             "|sigma|_2": sigma.sum(-1).mean().item(),
         }
-        for k, v in metrics_breakdown.items():
-            log_dict[f"train/{k}_mean"] = torch.tensor(v).mean()
-            # Maximize the metric
-            if METRIC_MAXIMIZE[k]:
-                best = torch.tensor(v).max()
-            else:
-                best = torch.tensor(v).min()
-            log_dict[f"train/{k}_best"] = best
+        for metric in metrics:
+            raw_values = torch.tensor(raw_metrics_inv[metric])
+            log_dict[f"train/{metric}_mean"] = raw_values.mean()
+            log_dict[f"train/{metric}_best"] = raw_values.max() if METRIC_MAXIMIZE[metric] else raw_values.min()
         wandb.log(log_dict)

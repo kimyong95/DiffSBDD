@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch_scatter import scatter_add, scatter_mean
 from collections import defaultdict
 import utils
+import einops
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion
 
 
@@ -372,7 +373,44 @@ class ConditionalDDPM(EnVariationalDiffusion):
             
         return z_t_lig, xh_pocket, eps_t_lig
 
-    def diversify(self, ligand, pocket, noising_steps, given_noise_list=defaultdict(lambda: None), callback=None):
+    @staticmethod
+    def crossover(z_lig: torch.Tensor, crossover_prob: float = 0.5) -> torch.Tensor:
+        """
+        Performs uniform crossover on a batch of molecules.
+
+        For each molecule, it randomly selects a partner from the batch. Then, for each
+        atom position, it randomly chooses which parent's atom to include in the
+        offspring, based on the crossover_prob.
+
+        Args:
+            z_lig (torch.Tensor): The batch of molecules with shape
+                                (batch_size, num_atoms, atom_dim).
+            crossover_prob (float): The probability of an atom being kept from the
+                                    first parent. Defaults to 0.5.
+
+        Returns:
+            torch.Tensor: The new batch of offspring molecules with the same shape.
+        """
+        # Ensure the batch size is at least 2
+        if z_lig.shape[0] < 2:
+            return z_lig
+
+        # 1. Randomly pair up every molecule with a partner from the batch
+        indices = torch.randperm(z_lig.shape[0])
+        parents1 = z_lig
+        parents2 = z_lig[indices]
+
+        # 2. Create a binary mask for the crossover
+        # The shape is (batch_size, num_atoms, 1), which broadcasts to the atom dimension
+        mask = torch.rand(z_lig.shape[0], z_lig.shape[1], 1, device=z_lig.device) > crossover_prob
+
+        # 3. Create offspring using the mask
+        # torch.where(condition, x, y) chooses from x if condition is True, else from y.
+        offspring = torch.where(mask, parents1, parents2)
+
+        return offspring
+    
+    def diversify(self, ligand, pocket, noising_steps, given_noise_list=defaultdict(lambda: None), callback=None, crossover=False):
         """
         Diversifies a set of ligands via noise-denoising
         """
@@ -381,6 +419,20 @@ class ConditionalDDPM(EnVariationalDiffusion):
         ligand, pocket = self.normalize(ligand, pocket)
 
         z_lig, xh_pocket, _ = self.partially_noised_ligand(ligand, pocket, noising_steps, given_noise=given_noise_list[0])
+
+        # This will discard the second half of the z_lig, they will be replaced by the offspring
+        if crossover:
+            z_lig_parent = z_lig[:len(z_lig)//2]
+            ligand_mask_parent = ligand['mask'][:len(z_lig)//2]
+
+            # Crossover
+            z_lig_offspring = self.crossover(torch.stack(utils.batch_to_list(z_lig_parent, ligand_mask_parent)))
+            z_lig_offspring = einops.rearrange(z_lig_offspring, 'b n d -> (b n) d')
+            mean = scatter_mean(z_lig_offspring[:, :self.n_dims], ligand_mask_parent, dim=0)
+            z_lig_offspring[:, :self.n_dims] -= mean[ligand_mask_parent]
+            
+            # Family = Parent + Offspring
+            z_lig = torch.cat([z_lig_parent, z_lig_offspring], dim=0)
 
         timesteps = self.T
         n_samples = len(pocket['size'])

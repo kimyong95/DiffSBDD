@@ -36,8 +36,8 @@ class Objective:
     # - normalized_objective_values: tensor of (N, K), lower is better, roughly in [0, 1] range
     def __call__(self, molecules):
 
-        raw_values = torch.zeros((len(molecules), len(self.metrics)))
         normalized_objective_values = torch.zeros((len(molecules), len(self.metrics)))
+        raw_metrics = []
         
         # mol_results = []
         # for molecule in molecules:
@@ -46,19 +46,16 @@ class Objective:
         mol_results = self.evaluator.evaluate_batch(molecules, proteins=[self.pocket_pdbfile]*len(molecules))
 
         for i, mol_result in enumerate(mol_results):
+            raw_metric = {}
             for j, metric in enumerate(self.metrics):
                 raw_value, normalized_obj_value = self.get_objective_values(mol_result, metric)
-                raw_values[i, j] = raw_value
                 normalized_objective_values[i, j] = normalized_obj_value
+                raw_metric[metric] = raw_value
+            raw_metrics.append(raw_metric)
         
-        metrics_breakdown = {
-            metric_name: raw_values[:, i].tolist()
-            for i, metric_name in enumerate(self.metrics)
-        }
-
         self.objectives_consumption += len(molecules)
 
-        return metrics_breakdown, normalized_objective_values
+        return raw_metrics, normalized_objective_values
     
     # Input: raw metric value (could be None)
     # Output:

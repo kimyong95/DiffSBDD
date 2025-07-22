@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from typing import List
 
 from utils import seed_everything
 import numpy as np
@@ -7,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from Bio.PDB import PDBParser
 from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.DataStructs import BulkTanimotoSimilarity
 import pandas as pd
 import random
 import wandb
@@ -14,14 +17,18 @@ from objective import Objective, METRIC_MAXIMIZE
 from collections import defaultdict
 from torch_scatter import scatter_mean
 from openbabel import openbabel
+from pymoo.indicators.hv import HV
 openbabel.obErrorLog.StopLogging()  # suppress OpenBabel messages
 
 import utils
+from typing import Dict
 from lightning_modules import LigandPocketDDPM
 from constants import FLOAT_TYPE, INT_TYPE
 from analysis.molecule_builder import build_molecule, process_molecule
 from analysis.metrics import MoleculeProperties
 from sbdd_metrics.metrics import FullEvaluator
+
+from utils_moo import EvaluatedMolecule, log_molecules_objective_values
 
 def prepare_from_sdf_files(sdf_files, atom_encoder):
 
@@ -70,7 +77,7 @@ def prepare_substructure(ref_ligand, fix_atoms, pdb_model):
 def diversify_ligands(model, pocket, mols, timesteps,
                     sanitize=False,
                     largest_frag=False,
-                    relax_iter=0):
+                    relax_iter=0, crossover=False):
     """
     Diversify ligands for a specified pocket.
     
@@ -95,7 +102,7 @@ def diversify_ligands(model, pocket, mols, timesteps,
     # Pocket's center of mass
     pocket_com_before = scatter_mean(pocket['x'], pocket['mask'], dim=0)
 
-    out_lig, out_pocket, _, _, _ = model.ddpm.diversify(ligand, pocket, noising_steps=timesteps)
+    out_lig, out_pocket, _, _, _ = model.ddpm.diversify(ligand, pocket, noising_steps=timesteps, crossover=crossover)
 
     # Move generated molecule back to the original pocket position
     pocket_com_after = scatter_mean(out_pocket[:, :model.x_dims], pocket_mask, dim=0)
@@ -135,20 +142,23 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, default='qed')
     parser.add_argument('--timesteps', type=int, default=100)
     parser.add_argument('--population_size', type=int, default=32)
-    parser.add_argument('--evolution_steps', type=int, default=1000)
-    parser.add_argument('--top_k', type=int, default=4)
+    parser.add_argument('--evolution_steps', type=int, default=300)
     parser.add_argument('--outfile', type=Path, default='output.sdf')
     parser.add_argument('--relax', action='store_true')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--mode', type=str, default='egd', choices=['egd', 'sbdd-ea'])
+    parser.add_argument('--sbdd_top_k', type=int, default=4)
 
 
     args = parser.parse_args()
     seed = args.seed
     seed_everything(seed)
 
+    name_str = args.mode
+
     run = wandb.init(
-        project="guide-sbdd",
-        name=f"evolutionary-s{seed}-{args.objective}",
+        project=f"sbdd-multi-objective",
+        name=f"{name_str}-s{seed}-{args.objective}",
         config=args,
     )
 
@@ -156,9 +166,9 @@ if __name__ == "__main__":
 
     device = "cuda"
 
+    sbdd_top_k = args.sbdd_top_k
     population_size = args.population_size
     evolution_steps = args.evolution_steps
-    top_k = args.top_k
 
     # Load model
     model = LigandPocketDDPM.load_from_checkpoint(
@@ -170,86 +180,69 @@ if __name__ == "__main__":
     pdb_model = PDBParser(QUIET=True).get_structure('', args.pdbfile)[0]
     # Define pocket based on reference ligand
     residues = utils.get_pocket_from_ligand(pdb_model, args.ref_ligand)
-    pocket = model.prepare_pocket(residues, repeats=population_size)
 
     metrics = args.objective.split(";")
     objective_fn = Objective(metrics, args.pocket_pdbfile)
 
     ref_mol = Chem.SDMolSupplier(args.ref_ligand)[0]
 
-    # Store molecules in history dataframe 
-    buffer = pd.DataFrame(columns=['generation', 'score', 'fate' 'mol', 'smiles'])
-
     # Population initialization
-    _, ref_objective_value = objective_fn([ref_mol])
-    ref_objective_value = ref_objective_value.sum(1)
+    ref_metric, ref_objective_value = objective_fn([ref_mol])
+    buffer = [
+        EvaluatedMolecule(ref_mol, ref_objective_value[0], ref_metric[0])
+    ] * population_size
     
-    buffer_df = pd.DataFrame([{'generation': 0,
-        'score': -ref_objective_value.item(),  # Put negative because we want to maximize buffer[score]
-        'fate': 'initial', 'mol': ref_mol,
-        'smiles': Chem.MolToSmiles(ref_mol)}])
-    buffer = pd.concat([buffer, buffer_df], ignore_index=True)
-
-    print(f"Reference molecule objective value (lower better): {ref_objective_value}")
-
     for generation_idx in range(evolution_steps):
 
-        if generation_idx == 0:
-            molecules = buffer['mol'].tolist() * population_size
-        else:
-            # Select top k molecules from previous generation
-            previous_gen = buffer[buffer['generation'] == generation_idx]
-            top_k_molecules = previous_gen.nlargest(top_k, 'score')['mol'].tolist()
-            molecules = top_k_molecules * (population_size // top_k)
-
-            # Update the fate of selected top k molecules in the buffer
-            buffer.loc[buffer['generation'] == generation_idx, 'fate'] = 'survived'
-
-            # Ensure the right number of molecules
-            if len(molecules) < population_size:
-                molecules += [random.choice(molecules) for _ in range(population_size - len(molecules))]
-
-
-        # Diversify molecules
-        assert len(molecules) == population_size, f"Wrong number of molecules: {len(molecules)} when it should be {population_size}"
-
+        # 1. Diversify molecules from the buffer
+        molecules_to_diversify = [buffer_item.molecule for buffer_item in buffer]
+        
         with torch.inference_mode():
-            molecules = diversify_ligands(model,
-                                        pocket,
-                                        molecules,
-                                    timesteps=args.timesteps,
-                                    sanitize=True,
-                                    relax_iter=(200 if args.relax else 0))
+            if args.mode == 'egd':
+                # Crossover will double the batch size
+                pocket = model.prepare_pocket(residues, repeats=population_size * 2)
+                molecules_to_diversify = molecules_to_diversify + molecules_to_diversify
+                diversified_molecules = diversify_ligands(model,
+                                            pocket,
+                                            molecules_to_diversify,
+                                        timesteps=args.timesteps,
+                                        sanitize=True,
+                                        relax_iter=(200 if args.relax else 0),
+                                        crossover=True)
+            elif args.mode == 'sbdd-ea':
+                pocket = model.prepare_pocket(residues, repeats=population_size)
+                diversified_molecules = diversify_ligands(model,
+                                            pocket,
+                                            molecules_to_diversify,
+                                        timesteps=args.timesteps,
+                                        sanitize=True,
+                                        relax_iter=(200 if args.relax else 0),
+                                        crossover=False)
         
         
-        # Evaluate and save molecules
-        raw_metrics, objective_values = objective_fn(molecules)
-        objective_values = objective_values.sum(1)
-        raw_metrics_inv = pd.DataFrame(raw_metrics).to_dict('list')
+        # 2. Evaluate, select, and update buffer
+        raw_metrics, objective_values = objective_fn(diversified_molecules)
 
-        for mol, obj_value in zip(molecules, objective_values):
-            buffer_df = pd.DataFrame([
-                {'generation': generation_idx + 1,
-                'score': -obj_value.item(), # Put negative because we want to maximize buffer[score]
-                'fate': 'purged', 'mol': mol,
-                'smiles': Chem.MolToSmiles(mol)}])
-            buffer = pd.concat([buffer, buffer_df], ignore_index=True)
+        candicates = [
+            EvaluatedMolecule(mol, obj_values, raw_metric)
+            for mol, obj_values, raw_metric in zip(diversified_molecules, objective_values, raw_metrics)
+        ]
 
-        # wandb log the score lower better
-        log_dict = {
-            "train/score_mean": objective_values.mean(),
-            "train/score_best": objective_values.min(),
-            "step": generation_idx,
-            "train/feasible_mol_rate": len(molecules) / population_size,
-        }
-        for metric in metrics:
-            raw_values = torch.tensor(raw_metrics_inv[metric])
-            log_dict[f"train/{metric}_mean"] = raw_values.mean()
-            log_dict[f"train/{metric}_best"] = raw_values.max() if METRIC_MAXIMIZE[metric] else raw_values.min()
-        wandb.log(log_dict)
+        log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="candidates", commit=False)
 
-    # Make SDF files
-    utils.write_sdf_file(args.outfile, molecules)
-    # Save buffer
-    buffer.drop(columns=['mol'])
-    buffer.to_csv(args.outfile.with_suffix('.csv'))
+        if args.mode == 'egd':
+            # 3. Union with family, and select best molecules based on the objective values
+            buffer.extend(candicates)
+            buffer = sorted(buffer, reverse=False)[:population_size]
+        elif args.mode == 'sbdd-ea':
+            # 3. Drop the parents
+            buffer = candicates
+            buffer = sorted(buffer, reverse=False)[:sbdd_top_k]
+            while len(buffer) < population_size:
+                buffer.extend(buffer)
+            buffer = buffer[:population_size]
+
+        log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="population", commit=True)
+
+
+    

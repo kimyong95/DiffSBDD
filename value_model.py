@@ -104,7 +104,7 @@ class ValueModel(nn.Module):
         self.model.requires_grad_(False)
 
         self.x_scaler = BaseScaler(dimension)
-        self.y_scaler = StandardScaler(1)
+        self.y_scaler = BaseScaler(1)
 
         self.register_buffer("all_x", torch.empty(0, dimension, dtype=torch.float32))
         self.register_buffer("all_y", torch.empty(0, dtype=torch.float32))
@@ -119,9 +119,9 @@ class ValueModel(nn.Module):
             y_preds = self.likelihood(self.model(self.x_scaler.transform(x)))
         
         y_preds_mean = self.y_scaler.inverse_transform(y_preds.mean.to(device))
-        y_preds_var = y_preds.variance.to(device) * (self.y_scaler.std.to(device)**2)
+        y_preds_var = y_preds.variance.to(device)
 
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         return y_preds_mean.to(device), y_preds_var.to(device)
 
@@ -130,8 +130,13 @@ class ValueModel(nn.Module):
     def add_model_data(self, x, y):
         device = x.device
 
-        self.all_x = torch.cat([self.all_x, x], dim=0)
-        self.all_y = torch.cat([self.all_y, y], dim=0)
+        # self.all_x = torch.cat([self.all_x, x], dim=0)
+        # self.all_y = torch.cat([self.all_y, y], dim=0)
+
+        self.all_x = x
+        self.all_y = y
+
+        
 
         self.x_scaler.fit(self.all_x)
         self.y_scaler.fit(self.all_y)
