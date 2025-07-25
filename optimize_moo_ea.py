@@ -152,6 +152,7 @@ if __name__ == "__main__":
                     diversify_from_timestep=args.timesteps,
                     sanitize=True,
                     relax_iter=(200 if args.relax else 0),
+                    largest_frag=True,
                     crossover=True
                 )
             elif args.mode == 'sbdd-ea':
@@ -164,6 +165,7 @@ if __name__ == "__main__":
                     diversify_from_timestep=args.timesteps,
                     sanitize=True,
                     relax_iter=(200 if args.relax else 0),
+                    largest_frag=True,
                     crossover=False
                 )
         

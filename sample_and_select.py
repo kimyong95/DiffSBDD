@@ -233,7 +233,7 @@ if __name__ == "__main__":
                                     add_hydrogens=False,
                                     sanitize=True,
                                     relax_iter=(200 if args.relax else 0),
-                                    largest_frag=False)
+                                    largest_frag=True)
             if mol is not None:
                 molecules.append(mol)
             else:
@@ -303,7 +303,7 @@ if __name__ == "__main__":
     with torch.inference_mode():
         molecules, pred_z0_lig_traj = model.generate_ligands(
             args.pdbfile, batch_size, None, args.ref_ligand, ref_ligand,
-            num_nodes_lig, sanitize=True, largest_frag=False,
+            num_nodes_lig, sanitize=True, largest_frag=True,
             relax_iter=(200 if args.relax else 0),
             diversify_from_timestep=args.diversify_from_timestep,
             callback=callback_func,
