@@ -74,64 +74,6 @@ def prepare_substructure(ref_ligand, fix_atoms, pdb_model):
     return coord, one_hot
 
 
-def diversify_ligands(model, pocket, mols, timesteps,
-                    sanitize=False,
-                    largest_frag=False,
-                    relax_iter=0, crossover=False):
-    """
-    Diversify ligands for a specified pocket.
-    
-    Parameters:
-        model: The model instance used for diversification.
-        pocket: The pocket information including coordinates and types.
-        mols: List of RDKit molecule objects to be diversified.
-        timesteps: Number of denoising steps to apply during diversification.
-        sanitize: If True, performs molecule sanitization post-generation (default: False).
-        largest_frag: If True, only the largest fragment of the generated molecule is returned (default: False).
-        relax_iter: Number of iterations for force field relaxation of the generated molecules (default: 0).
-    
-    Returns:
-        A list of diversified RDKit molecule objects.
-    """
-
-    ligand = utils.prepare_ligands_from_mols(mols, model.lig_type_encoder, device=model.device)
-
-    pocket_mask = pocket['mask']
-    lig_mask = ligand['mask']
-
-    # Pocket's center of mass
-    pocket_com_before = scatter_mean(pocket['x'], pocket['mask'], dim=0)
-
-    out_lig, out_pocket, _, _, _ = model.ddpm.diversify(ligand, pocket, noising_steps=timesteps, crossover=crossover)
-
-    # Move generated molecule back to the original pocket position
-    pocket_com_after = scatter_mean(out_pocket[:, :model.x_dims], pocket_mask, dim=0)
-
-    out_pocket[:, :model.x_dims] += \
-        (pocket_com_before - pocket_com_after)[pocket_mask]
-    out_lig[:, :model.x_dims] += \
-        (pocket_com_before - pocket_com_after)[lig_mask]
-
-    # Build mol objects
-    x = out_lig[:, :model.x_dims].detach().cpu()
-    atom_type = out_lig[:, model.x_dims:].argmax(1).detach().cpu()
-
-    molecules = []
-    for mol_pc in zip(utils.batch_to_list(x, lig_mask),
-                      utils.batch_to_list(atom_type, lig_mask)):
-
-        mol = build_molecule(*mol_pc, model.dataset_info, add_coords=True)
-        mol = process_molecule(mol,
-                               add_hydrogens=False,
-                               sanitize=sanitize,
-                               relax_iter=relax_iter,
-                               largest_frag=largest_frag)
-        if mol is not None:
-            molecules.append(mol)
-
-    return molecules
-
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -200,32 +142,39 @@ if __name__ == "__main__":
         with torch.inference_mode():
             if args.mode == 'egd':
                 # Crossover will double the batch size
-                pocket = model.prepare_pocket(residues, repeats=population_size * 2)
                 molecules_to_diversify = molecules_to_diversify + molecules_to_diversify
-                diversified_molecules = diversify_ligands(model,
-                                            pocket,
-                                            molecules_to_diversify,
-                                        timesteps=args.timesteps,
-                                        sanitize=True,
-                                        relax_iter=(200 if args.relax else 0),
-                                        crossover=True)
+                ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
+                diversified_molecules, _ = model.generate_ligands(
+                    pdb_file=args.pdbfile,
+                    ref_ligand_path=args.ref_ligand,
+                    ref_ligand=ligands_to_diversify,
+                    n_samples=len(molecules_to_diversify),
+                    diversify_from_timestep=args.timesteps,
+                    sanitize=True,
+                    relax_iter=(200 if args.relax else 0),
+                    crossover=True
+                )
             elif args.mode == 'sbdd-ea':
-                pocket = model.prepare_pocket(residues, repeats=population_size)
-                diversified_molecules = diversify_ligands(model,
-                                            pocket,
-                                            molecules_to_diversify,
-                                        timesteps=args.timesteps,
-                                        sanitize=True,
-                                        relax_iter=(200 if args.relax else 0),
-                                        crossover=False)
+                ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
+                diversified_molecules, _ = model.generate_ligands(
+                    pdb_file=args.pdbfile,
+                    ref_ligand_path=args.ref_ligand,
+                    ref_ligand=ligands_to_diversify,
+                    n_samples=len(molecules_to_diversify),
+                    diversify_from_timestep=args.timesteps,
+                    sanitize=True,
+                    relax_iter=(200 if args.relax else 0),
+                    crossover=False
+                )
         
+        successful_molecules = [mol for mol in diversified_molecules if mol is not None]
         
         # 2. Evaluate, select, and update buffer
-        raw_metrics, objective_values = objective_fn(diversified_molecules)
+        raw_metrics, objective_values = objective_fn(successful_molecules)
 
         candicates = [
             EvaluatedMolecule(mol, obj_values, raw_metric)
-            for mol, obj_values, raw_metric in zip(diversified_molecules, objective_values, raw_metrics)
+            for mol, obj_values, raw_metric in zip(successful_molecules, objective_values, raw_metrics)
         ]
 
         log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="candidates", commit=False)
@@ -243,6 +192,3 @@ if __name__ == "__main__":
             buffer = buffer[:population_size]
 
         log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="population", commit=True)
-
-
-    

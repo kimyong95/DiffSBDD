@@ -73,17 +73,15 @@ if __name__ == "__main__":
     parser.add_argument('--pdbfile', type=str, default='example/5ndu.pdb')
     parser.add_argument('--pocket_pdbfile', type=str, default='example/5ndu_pocket.pdb')
     parser.add_argument('--ref_ligand', type=str, default='example/5ndu_C_8V2.sdf')
-    parser.add_argument('--objective', type=str, default='qed')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--relax', action='store_true')
+    parser.add_argument('--objective', type=str, default="sa;qed;vina")
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--sub_batch_size', type=int, default=4, help="Sub-batch size for sampling, should be smaller than batch_size.") 
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
-    parser.add_argument('--resi_list', type=str, nargs='+', default=None)
-    parser.add_argument('--all_frags', action='store_true')
-    parser.add_argument('--sanitize', action='store_true')
-    parser.add_argument('--relax', action='store_true')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--shift_constants', type=str, default="best")
+    parser.add_argument('--shift_constants', type=str, default="0")
     parser.add_argument('--lambda_normalization', type=str, default="l2")
+    parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
 
 
     args = parser.parse_args()
@@ -108,6 +106,7 @@ if __name__ == "__main__":
         args.checkpoint, map_location=device)
     model = model.to(device)
 
+    ea_optimize_steps = args.ea_optimize_steps
     batch_size = args.batch_size
     sub_batch_size = args.sub_batch_size
     atom_dim = model.ddpm.n_dims + model.ddpm.atom_nf
@@ -232,9 +231,9 @@ if __name__ == "__main__":
             mol = build_molecule(mol_pc[0], mol_pc[1], model.dataset_info, add_coords=True)
             mol = process_molecule(mol,
                                     add_hydrogens=False,
-                                    sanitize=args.sanitize,
+                                    sanitize=True,
                                     relax_iter=(200 if args.relax else 0),
-                                    largest_frag=not args.all_frags)
+                                    largest_frag=False)
             if mol is not None:
                 molecules.append(mol)
             else:
@@ -289,7 +288,7 @@ if __name__ == "__main__":
         final_zs_pocket = expanded_xh_pocket[select_pocket_mask]
 
         selected_molecules = [
-            EvaluatedMolecule(molecules[i], multi_objective_values[i], successful_raw_metrics[i])
+            EvaluatedMolecule(molecules[i], multi_objective_values[i], raw_metrics[i])
             for i in select_indices
         ]
 
@@ -303,8 +302,8 @@ if __name__ == "__main__":
 
     with torch.inference_mode():
         molecules, pred_z0_lig_traj = model.generate_ligands(
-            args.pdbfile, batch_size, args.resi_list, args.ref_ligand, ref_ligand,
-            num_nodes_lig, args.sanitize, largest_frag=not args.all_frags,
+            args.pdbfile, batch_size, None, args.ref_ligand, ref_ligand,
+            num_nodes_lig, sanitize=True, largest_frag=False,
             relax_iter=(200 if args.relax else 0),
             diversify_from_timestep=args.diversify_from_timestep,
             callback=callback_func,
@@ -324,7 +323,6 @@ if __name__ == "__main__":
         EvaluatedMolecule(mol, obj_values, raw_metric)
         for mol, obj_values, raw_metric in zip(success_molecules, objective_values, raw_metrics)
     ]
-
     
     log_molecules_objective_values(
         selected_molecules, 
