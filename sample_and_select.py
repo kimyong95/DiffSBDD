@@ -39,6 +39,45 @@ torch.cuda.set_per_process_memory_fraction(reserve_fraction, torch.cuda.current_
 from torch import nn
 from value_model import ValueModel
 
+def zt_to_z0(zt_lig, xh_pocket, lig_mask, pocket_mask, t, model):
+    """
+    Convert zt_lig to z0_lig using the DDPM model.
+    """
+    batch_size = len(torch.unique(lig_mask, return_counts=True)[1])
+    s = t - 1
+    t_array = torch.full((batch_size, 1), fill_value=t, device=device) / model.ddpm.T
+    s_array = torch.full((batch_size, 1), fill_value=s, device=device) / model.ddpm.T
+
+    ####### zt to z0 #######
+    zt_lig, xh_pocket, pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
+        s=s_array, t=t_array, zt_lig=zt_lig, xh0_pocket=xh_pocket,
+        ligand_mask=lig_mask, pocket_mask=pocket_mask
+    )
+
+    # for i, _s in enumerate(reversed(range(0, s))):
+    #     s_array = torch.full((new_batch_size, 1), fill_value=_s, device=zt_lig.device)
+    #     t_array = s_array + 1
+    #     s_array = s_array /  model.ddpm.T
+    #     t_array = t_array /  model.ddpm.T
+    #     zt_lig, expanded_xh_pocket, pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
+    #         s_array, t_array, zt_lig, xh0_pocket=expanded_xh_pocket, ligand_mask=new_lig_mask, pocket_mask=new_pocket_mask)
+    
+    ####### z0 to xh0 #######
+    x_lig, h_lig, x_pocket, h_pocket, _ = model.ddpm.sample_p_xh_given_z0(pred_z0_lig, xh_pocket, lig_mask, pocket_mask, batch_size)
+
+    xh_pocket = torch.cat([x_pocket, h_pocket], dim=1)
+
+    return x_lig, h_lig, x_pocket, h_pocket
+
+def shift_x_lig_back_to_pocket_com_before(x_lig, lig_mask, original_pocket, new_pocket, pocket_mask):
+
+    pocket_com_before = scatter_mean(original_pocket, pocket_mask, dim=0)
+    pocket_com_after = scatter_mean(new_pocket, pocket_mask, dim=0)
+
+    x_lig = x_lig + (pocket_com_before - pocket_com_after)[lig_mask]
+
+    return x_lig
+
 def is_number(s):
   """
   Checks if a string is a number, including negatives and decimals.
@@ -49,7 +88,7 @@ def is_number(s):
   except ValueError:
     return False
 
-def aggregate_objectives(multi_objective_values, shift_constants, weight_lambda):
+def aggregate_objectives(multi_objective_values, shift_constants, weight_lambda, mode):
     """
     Aggregate multi-objective values using a specified function.
 
@@ -61,7 +100,18 @@ def aggregate_objectives(multi_objective_values, shift_constants, weight_lambda)
     Returns:
         torch.Tensor: A tensor of aggregated values.
     """
-    aggregated_objective_value = - torch.logsumexp( - (multi_objective_values - shift_constants[None,:]) / weight_lambda, dim=1 )
+
+    if mode == "max":
+        aggregated_objective_value = torch.max(
+            (multi_objective_values - shift_constants[None, :]) / weight_lambda[None, :],
+            dim=1
+        ).values
+    elif mode == "logsumexp":
+        # Using logsumexp to aggregate the objectives
+        aggregated_objective_value = torch.logsumexp(
+            (multi_objective_values - shift_constants[None, :]) / weight_lambda[None, :],
+            dim=1
+        )
 
     return aggregated_objective_value
 
@@ -78,8 +128,9 @@ if __name__ == "__main__":
     parser.add_argument('--sub_batch_size', type=int, default=4, help="Sub-batch size for sampling, should be smaller than batch_size.") 
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--shift_constants', type=str, default="0")
+    parser.add_argument('--shift_constants', type=str, default="best")
     parser.add_argument('--lambda_normalization', type=str, default="l2")
+    parser.add_argument('--aggre_mode', type=str, default="max")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
     parser.add_argument('--largest_frag', action='store_true', help="If set, only the largest fragment of the generated molecule will be kept.")
 
@@ -142,7 +193,6 @@ if __name__ == "__main__":
         lambda_ = lambda_ / lambda_.norm(dim=1, p=2, keepdim=True)
     elif args.lambda_normalization == "l1":
         lambda_ = lambda_ / lambda_.norm(dim=1, p=1, keepdim=True)
-
     @torch.inference_mode()
     def callback_func(pred_z0_lig, s, lig_mask, pocket, xh_pocket):
         """
@@ -191,42 +241,18 @@ if __name__ == "__main__":
         zt_lig_to_be_returned = zt_lig.clone()
         xh_pocket_to_be_returned = expanded_xh_pocket.clone()
 
-        # 3. For each `zt_given_z0`, take one denoising step to obtain `zs`
-        s_array = torch.full((new_batch_size, 1), fill_value=s, device=device) / model.ddpm.T
-        pred_zs, expanded_xh_pocket, _pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
-            s=s_array, t=t_array, zt_lig=zt_lig, xh0_pocket=expanded_xh_pocket,
-            ligand_mask=new_lig_mask, pocket_mask=new_pocket_mask
-        )
-
-        # 3. For each `zt_given_z0`, take one denoising step to obtain `z0`
-        # for i, _s in enumerate(reversed(range(0, s))):
-        #     s_array = torch.full((new_batch_size, 1), fill_value=_s, device=zt_lig.device)
-        #     t_array = s_array + 1
-        #     s_array = s_array /  model.ddpm.T
-        #     t_array = t_array /  model.ddpm.T
-        #     zt_lig, expanded_xh_pocket, _pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
-        #         s_array, t_array, zt_lig, xh0_pocket=expanded_xh_pocket, ligand_mask=new_lig_mask, pocket_mask=new_pocket_mask)
+        x0_given_zt_lig, h0_given_zt_lig, x_pocket, h_pocket = zt_to_z0(zt_lig, expanded_xh_pocket, new_lig_mask, new_pocket_mask, t_int, model)
         
-        x_lig, h_lig, x_pocket, h_pocket, _ = model.ddpm.sample_p_xh_given_z0(
-            _pred_z0_lig, expanded_xh_pocket, new_lig_mask, new_pocket_mask, new_batch_size)
+        x0_given_zt_lig = shift_x_lig_back_to_pocket_com_before(x0_given_zt_lig, new_lig_mask, expanded_pocket_x, x_pocket, new_pocket_mask)
 
-        xh_pocket = torch.cat([x_pocket, h_pocket], dim=1)
+        ############################################################
+        # Build molecules from x0_given_zt_lig and h0_given_zt_lig #
+        ############################################################
 
-        ########################################
-        # Build molecules from x_lig and h_lig #
-        ########################################
-        ndims = model.ddpm.n_dims
-
-        pocket_com_before = scatter_mean(expanded_pocket_x, new_pocket_mask, dim=0)
-        pocket_com_after = scatter_mean(xh_pocket[:, :ndims], new_pocket_mask, dim=0)
-
-        x_lig += \
-            (pocket_com_before - pocket_com_after)[new_lig_mask]
-
-        atom_type = torch.argmax(h_lig, dim=1)
+        atom_type = torch.argmax(h0_given_zt_lig, dim=1)
 
         molecules = []
-        for mol_pc in zip(utils.batch_to_list(x_lig.cpu(), new_lig_mask),
+        for mol_pc in zip(utils.batch_to_list(h0_given_zt_lig.cpu(), new_lig_mask),
                             utils.batch_to_list(atom_type.cpu(), new_lig_mask)):
 
             mol = build_molecule(mol_pc[0], mol_pc[1], model.dataset_info, add_coords=True)
@@ -274,7 +300,7 @@ if __name__ == "__main__":
         multi_objective_values_candidates = multi_objective_values.clone()
         for i in range(batch_size):
             lambda_i = lambda_[i, :]
-            aggregated_objective_values = aggregate_objectives(multi_objective_values_candidates, shift_constants, lambda_i)
+            aggregated_objective_values = aggregate_objectives(multi_objective_values_candidates, shift_constants, lambda_i, mode=args.aggre_mode)
             select_index = aggregated_objective_values.argmin().item()
             multi_objective_values_candidates[select_index, :] = float('inf')  # Mark as used
 
