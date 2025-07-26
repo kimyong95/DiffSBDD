@@ -61,7 +61,6 @@ def aggregate_objectives(multi_objective_values, shift_constants, weight_lambda)
     Returns:
         torch.Tensor: A tensor of aggregated values.
     """
-    
     aggregated_objective_value = - torch.logsumexp( - (multi_objective_values - shift_constants[None,:]) / weight_lambda, dim=1 )
 
     return aggregated_objective_value
@@ -82,7 +81,7 @@ if __name__ == "__main__":
     parser.add_argument('--shift_constants', type=str, default="0")
     parser.add_argument('--lambda_normalization', type=str, default="l2")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
-
+    parser.add_argument('--largest_frag', action='store_true', help="If set, only the largest fragment of the generated molecule will be kept.")
 
     args = parser.parse_args()
     seed = args.seed
@@ -91,9 +90,11 @@ if __name__ == "__main__":
     if args.diversify_from_timestep == -1:
         args.diversify_from_timestep = None
 
+    is_filter_atom = "t" if args.largest_frag else "f"
+
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-s={seed}-c={args.shift_constants}-{args.lambda_normalization}-{args.objective}",
+        name=f"sample-and-select-fil={is_filter_atom}-s={seed}-c={args.shift_constants}-{args.lambda_normalization}-{args.objective}",
         config=args,
     )
 
@@ -187,38 +188,38 @@ if __name__ == "__main__":
             lig_mask=new_lig_mask, pocket_mask=new_pocket_mask, gamma_t=gamma_t
         )
 
+        zt_lig_to_be_returned = zt_lig.clone()
+        xh_pocket_to_be_returned = expanded_xh_pocket.clone()
+
         # 3. For each `zt_given_z0`, take one denoising step to obtain `zs`
         s_array = torch.full((new_batch_size, 1), fill_value=s, device=device) / model.ddpm.T
-
-        zs_lig, zs_pocket, pred_z0_given_zs_lig = model.ddpm.sample_p_zs_given_zt(
+        pred_zs, expanded_xh_pocket, _pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
             s=s_array, t=t_array, zt_lig=zt_lig, xh0_pocket=expanded_xh_pocket,
             ligand_mask=new_lig_mask, pocket_mask=new_pocket_mask
         )
 
-        #############################################
-        # Build molecules from pred_z0_given_zs_lig #
-        #############################################
+        # 3. For each `zt_given_z0`, take one denoising step to obtain `z0`
+        # for i, _s in enumerate(reversed(range(0, s))):
+        #     s_array = torch.full((new_batch_size, 1), fill_value=_s, device=zt_lig.device)
+        #     t_array = s_array + 1
+        #     s_array = s_array /  model.ddpm.T
+        #     t_array = t_array /  model.ddpm.T
+        #     zt_lig, expanded_xh_pocket, _pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
+        #         s_array, t_array, zt_lig, xh0_pocket=expanded_xh_pocket, ligand_mask=new_lig_mask, pocket_mask=new_pocket_mask)
+        
+        x_lig, h_lig, x_pocket, h_pocket, _ = model.ddpm.sample_p_xh_given_z0(
+            _pred_z0_lig, expanded_xh_pocket, new_lig_mask, new_pocket_mask, new_batch_size)
+
+        xh_pocket = torch.cat([x_pocket, h_pocket], dim=1)
+
+        ########################################
+        # Build molecules from x_lig and h_lig #
+        ########################################
         ndims = model.ddpm.n_dims
 
-        pred_z0_given_zs_lig[:, :ndims], zs_pocket[:, :ndims] = \
-            model.ddpm.remove_mean_batch(pred_z0_given_zs_lig[:, :ndims],
-                                   zs_pocket[:, :ndims],
-                                   new_lig_mask, new_pocket_mask)
-
-        # Convert pred_z0_given_zs_lig to molecules for inspection
-        x_lig, h_lig = model.ddpm.unnormalize(
-            pred_z0_given_zs_lig[:, :model.ddpm.n_dims],
-            pred_z0_given_zs_lig[:, model.ddpm.n_dims:],
-        )
-        h_lig = F.one_hot(torch.argmax(h_lig, dim=1), model.ddpm.atom_nf)
-
-        model.ddpm.assert_mean_zero_with_mask(x_lig[:, :ndims], new_lig_mask)
-
         pocket_com_before = scatter_mean(expanded_pocket_x, new_pocket_mask, dim=0)
-        pocket_com_after = scatter_mean(zs_pocket[:, :ndims], new_pocket_mask, dim=0)
+        pocket_com_after = scatter_mean(xh_pocket[:, :ndims], new_pocket_mask, dim=0)
 
-        zs_pocket[:, :ndims] += \
-            (pocket_com_before - pocket_com_after)[new_pocket_mask]
         x_lig += \
             (pocket_com_before - pocket_com_after)[new_lig_mask]
 
@@ -233,7 +234,7 @@ if __name__ == "__main__":
                                     add_hydrogens=False,
                                     sanitize=True,
                                     relax_iter=(200 if args.relax else 0),
-                                    largest_frag=True)
+                                    largest_frag=args.largest_frag)
             if mol is not None:
                 molecules.append(mol)
             else:
@@ -284,8 +285,8 @@ if __name__ == "__main__":
         select_lig_mask = torch.stack(select_lig_mask).flatten()
         select_pocket_mask = torch.stack(select_pocket_mask).flatten()
 
-        final_zs_lig = zs_lig[select_lig_mask]
-        final_zs_pocket = expanded_xh_pocket[select_pocket_mask]
+        selected_zt_lig = zt_lig_to_be_returned[select_lig_mask]
+        selected_xh_pocket = xh_pocket_to_be_returned[select_pocket_mask]
 
         selected_molecules = [
             EvaluatedMolecule(molecules[i], multi_objective_values[i], raw_metrics[i])
@@ -298,12 +299,12 @@ if __name__ == "__main__":
             stage=f"intermediate",
         )
 
-        return {"z_lig": final_zs_lig, "xh_pocket": final_zs_pocket}
+        return {"z_lig": selected_zt_lig, "xh_pocket": selected_xh_pocket}
 
     with torch.inference_mode():
         molecules, pred_z0_lig_traj = model.generate_ligands(
             args.pdbfile, batch_size, None, args.ref_ligand, ref_ligand,
-            num_nodes_lig, sanitize=True, largest_frag=True,
+            num_nodes_lig, sanitize=True, largest_frag=args.largest_frag,
             relax_iter=(200 if args.relax else 0),
             diversify_from_timestep=args.diversify_from_timestep,
             callback=callback_func,

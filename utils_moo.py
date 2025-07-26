@@ -6,6 +6,7 @@ from rdkit import Chem
 from rdkit.DataStructs import BulkTanimotoSimilarity
 from rdkit.Chem import AllChem
 from pymoo.indicators.hv import HV
+from objective import METRIC_MAXIMIZE
 
 class EvaluatedMolecule:
     def __init__(self, molecule: Chem.Mol, objective_values: torch.Tensor, raw_metrics: Dict[str, float]):
@@ -146,6 +147,7 @@ def log_molecules_objective_values(evaluated_molecules: List[EvaluatedMolecule],
         f"{stage}/number_of_pareto": len(pareto_front),
     }
     for metric in metrics:
-        log_dict[f"{stage}/{metric}_mean"] = torch.tensor([mol.raw_metrics[metric] for mol in evaluated_molecules]).mean()
-    
+        metric_tensor = torch.tensor([mol.raw_metrics[metric] for mol in evaluated_molecules])
+        log_dict[f"{stage}/{metric}_mean"] = metric_tensor.mean()
+        log_dict[f"{stage}/{metric}_best"] = metric_tensor.max() if METRIC_MAXIMIZE[metric] else metric_tensor.min()
     wandb.log(log_dict, commit=commit)

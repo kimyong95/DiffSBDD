@@ -90,6 +90,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--mode', type=str, default='egd', choices=['egd', 'sbdd-ea'])
     parser.add_argument('--sbdd_top_k', type=int, default=4)
+    parser.add_argument('--largest_frag', action='store_true', help="If set, only the largest fragment of the generated molecule will be kept.")
 
 
     args = parser.parse_args()
@@ -97,10 +98,11 @@ if __name__ == "__main__":
     seed_everything(seed)
 
     name_str = args.mode
+    is_filter_atom = "t" if args.largest_frag else "f"
 
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"{name_str}-s{seed}-{args.objective}",
+        name=f"{name_str}-fil={is_filter_atom}-s{seed}-{args.objective}",
         config=args,
     )
 
@@ -152,7 +154,7 @@ if __name__ == "__main__":
                     diversify_from_timestep=args.timesteps,
                     sanitize=True,
                     relax_iter=(200 if args.relax else 0),
-                    largest_frag=True,
+                    largest_frag=args.largest_frag,
                     crossover=True
                 )
             elif args.mode == 'sbdd-ea':
@@ -165,7 +167,7 @@ if __name__ == "__main__":
                     diversify_from_timestep=args.timesteps,
                     sanitize=True,
                     relax_iter=(200 if args.relax else 0),
-                    largest_frag=True,
+                    largest_frag=args.largest_frag,
                     crossover=False
                 )
         
