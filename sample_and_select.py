@@ -145,7 +145,7 @@ if __name__ == "__main__":
 
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-fil={is_filter_atom}-s={seed}-c={args.shift_constants}-{args.lambda_normalization}-{args.objective}",
+        name=f"sample-and-select-ag={args.aggre_mode}-fil={is_filter_atom}-s={seed}-c={args.shift_constants}-{args.lambda_normalization}-{args.objective}",
         config=args,
     )
 
@@ -252,7 +252,7 @@ if __name__ == "__main__":
         atom_type = torch.argmax(h0_given_zt_lig, dim=1)
 
         molecules = []
-        for mol_pc in zip(utils.batch_to_list(h0_given_zt_lig.cpu(), new_lig_mask),
+        for mol_pc in zip(utils.batch_to_list(x0_given_zt_lig.cpu(), new_lig_mask),
                             utils.batch_to_list(atom_type.cpu(), new_lig_mask)):
 
             mol = build_molecule(mol_pc[0], mol_pc[1], model.dataset_info, add_coords=True)
