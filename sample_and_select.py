@@ -245,8 +245,8 @@ if __name__ == "__main__":
     parser.add_argument('--ref_ligand', type=str, default='example/5ndu_C_8V2.sdf')
     parser.add_argument('--relax', action='store_true')
     parser.add_argument('--objective', type=str, default="sa;qed;vina")
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--sub_batch_size', type=int, default=4, help="Sub-batch size for sampling, should be smaller than batch_size.") 
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--sub_batch_size', type=int, default=2, help="Sub-batch size for sampling, should be smaller than batch_size.") 
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--shift_constants', type=str, default="0")
@@ -435,7 +435,7 @@ if __name__ == "__main__":
             num_nodes_lig, sanitize=False, largest_frag=False,
             relax_iter=(200 if args.relax else 0),
             diversify_from_timestep=args.diversify_from_timestep,
-            # callback=callback_func,
+            callback=callback_func,
         )
     assert len(molecules) == batch_size
 
