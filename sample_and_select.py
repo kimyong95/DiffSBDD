@@ -39,37 +39,46 @@ torch.cuda.set_per_process_memory_fraction(reserve_fraction, torch.cuda.current_
 from torch import nn
 from value_model import ValueModel
 
-def zt_to_z0(zt_lig, xh_pocket, lig_mask, pocket_mask, t, model):
-    """
-    Convert zt_lig to z0_lig using the DDPM model.
-    """
-    batch_size = len(torch.unique(lig_mask, return_counts=True)[1])
-    s = t - 1
-    t_array = torch.full((batch_size, 1), fill_value=t, device=device) / model.ddpm.T
-    s_array = torch.full((batch_size, 1), fill_value=s, device=device) / model.ddpm.T
-
-    ####### zt to z0 #######
-    zt_lig, xh_pocket, pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
-        s=s_array, t=t_array, zt_lig=zt_lig, xh0_pocket=xh_pocket,
-        ligand_mask=lig_mask, pocket_mask=pocket_mask
-    )
-
-    # for i, _s in enumerate(reversed(range(0, s))):
-    #     s_array = torch.full((new_batch_size, 1), fill_value=_s, device=zt_lig.device)
-    #     t_array = s_array + 1
-    #     s_array = s_array /  model.ddpm.T
-    #     t_array = t_array /  model.ddpm.T
-    #     zt_lig, expanded_xh_pocket, pred_z0_lig = model.ddpm.sample_p_zs_given_zt(
-    #         s_array, t_array, zt_lig, xh0_pocket=expanded_xh_pocket, ligand_mask=new_lig_mask, pocket_mask=new_pocket_mask)
+def mu_ts_to_zs(mu_lig, xh0_pocket, lig_mask, pocket_mask, t, s, model):
     
-    ####### z0 to xh0 #######
-    x_lig, h_lig, x_pocket, h_pocket, _ = model.ddpm.sample_p_xh_given_z0(pred_z0_lig, xh_pocket, lig_mask, pocket_mask, batch_size)
+    gamma_s = model.ddpm.gamma(s)
+    gamma_t = model.ddpm.gamma(t)
 
-    xh_pocket = torch.cat([x_pocket, h_pocket], dim=1)
+    sigma_s = model.ddpm.sigma(gamma_s, target_tensor=mu_lig)
+    sigma_t = model.ddpm.sigma(gamma_t, target_tensor=mu_lig)
+
+    sigma2_t_given_s, sigma_t_given_s, alpha_t_given_s = \
+        model.ddpm.sigma_and_alpha_t_given_s(gamma_t, gamma_s, mu_lig)
+
+    # Compute sigma for p(zs | zt).
+    sigma = sigma_t_given_s * sigma_s / sigma_t
+
+    # Sample zs given the parameters derived from zt.
+    zs_lig, xh0_pocket = model.ddpm.sample_normal_zero_com(mu_lig, xh0_pocket, sigma, lig_mask, pocket_mask)
+
+    # The zs_lig should have mean zero.
+    return zs_lig, xh0_pocket
+
+def zt_to_xh(zt_lig, xh_pocket, lig_mask, pocket_mask, t, model, with_noise):
+
+    batch_size = t.shape[0]
+    s0 = torch.zeros_like(t)
+    noise0 = torch.zeros_like(zt_lig) if not with_noise else None
+    
+    if t[0].item() > 0:
+        z0_lig, xh0_pocket, _ = model.ddpm.sample_p_zs_given_zt(s0, t, zt_lig, xh_pocket, lig_mask, pocket_mask, given_noise=noise0)
+        x_lig, h_lig, x_pocket, h_pocket = model.ddpm.sample_p_xh_given_z0(z0_lig, xh0_pocket, lig_mask, pocket_mask, batch_size, given_noise=noise0)
+    else:
+        x_lig, h_lig, x_pocket, h_pocket = model.ddpm.sample_p_xh_given_z0(zt_lig, xh_pocket , lig_mask, pocket_mask, batch_size, given_noise=noise0)
+
+    model.ddpm.assert_mean_zero_with_mask(x_lig, lig_mask)
 
     return x_lig, h_lig, x_pocket, h_pocket
 
-def shift_x_lig_back_to_pocket_com_before(x_lig, lig_mask, original_pocket, new_pocket, pocket_mask):
+def shift_x_lig_back_to_pocket_com_before(
+        x_lig, lig_mask,
+        original_pocket, new_pocket, pocket_mask
+    ):
 
     pocket_com_before = scatter_mean(original_pocket, pocket_mask, dim=0)
     pocket_com_after = scatter_mean(new_pocket, pocket_mask, dim=0)
@@ -107,13 +116,125 @@ def aggregate_objectives(multi_objective_values, shift_constants, weight_lambda,
             dim=1
         ).values
     elif mode == "logsumexp":
-        # Using logsumexp to aggregate the objectives
         aggregated_objective_value = torch.logsumexp(
             (multi_objective_values - shift_constants[None, :]) / weight_lambda[None, :],
             dim=1
         )
+    elif mode == "neglogsumexp":
+        aggregated_objective_value = - torch.logsumexp(
+            - (multi_objective_values - shift_constants[None, :]) / weight_lambda[None, :],
+            dim=1
+        )
 
     return aggregated_objective_value
+
+def _generate_weights_recursive(k: int, p: int):
+    """
+    Private recursive generator for integer combinations.
+    Yields all lists of k non-negative integers that sum to p.
+    """
+    # Base case: if only one objective is left, its value must be the remainder.
+    if k == 1:
+        yield [p]
+        return
+
+    # Recursive step: iterate through possible values for the current objective.
+    for i in range(p + 1):
+        # Generate combinations for the remaining k-1 objectives with the remaining sum p-i.
+        for sub_combination in _generate_weights_recursive(k - 1, p - i):
+            yield [i] + sub_combination
+
+def generate_simplex_lattice_weights(
+    k: int, 
+    p: int, 
+    dtype: torch.dtype = torch.float32, 
+    device: torch.device = None
+) -> torch.Tensor:
+    """
+    Generates evenly distributed weight vectors using the Simplex-Lattice Design.
+
+    Args:
+        k (int): The number of objectives (dimension of the weight vector).
+        p (int): The number of divisions for the simplex.
+        dtype (torch.dtype, optional): The desired data type of the output tensor. 
+                                       Defaults to torch.float32.
+        device (torch.device, optional): The desired device of the output tensor. 
+                                         Defaults to the default device.
+
+    Returns:
+        torch.Tensor: A tensor of shape (n, k) where n is the number of
+                      generated weights, and each row is a weight vector 
+                      summing to 1.
+    """
+    if k < 1 or p < 0:
+        raise ValueError("k must be >= 1 and p must be >= 0")
+    
+    # 1. Generate integer combinations that sum to p
+    integer_combinations = list(_generate_weights_recursive(k, p))
+    
+    weights_tensor = torch.tensor(
+        integer_combinations, 
+        dtype=dtype, 
+        device=device
+    )
+
+    weights_tensor /= p
+    
+    return weights_tensor
+
+def check_n_feasibility(n_target: int, k: int) -> tuple[bool, int]:
+    """
+    Checks if a target number of vectors 'n' is feasible for 'k' objectives.
+
+    Args:
+        n_target (int): The desired number of weight vectors.
+        k (int): The number of objectives.
+
+    Returns:
+        tuple[bool, int]: A tuple containing:
+                          - A boolean indicating if n_target is feasible.
+                          - The required number of divisions 'p' if feasible, 
+                            otherwise -1.
+    """
+    if n_target < 1 or k < 1:
+        return (False, -1)
+
+    p = 0
+    while True:
+        # Calculate n_calc = C(p + k - 1, k - 1)
+        try:
+            n_calc = math.comb(p + k - 1, k - 1)
+        except ValueError:
+            # This can happen if p=0 and k=1, where C(-1,0) is invalid for math.comb
+            # but the result should be 1. Let's handle it manually.
+            if p + k - 1 < k - 1:
+                 n_calc = 0 if n_target != 1 else 1
+            else: # Should not happen in normal flow
+                return(False,-1)
+
+        if n_calc == n_target:
+            return (True, p)
+        
+        if n_calc > n_target:
+            return (False, -1)
+        
+        p += 1
+
+def get_lambda(batch_size: int, num_objectives: int, mode, device):
+    if mode == "l2":
+        lambda_ = torch.randn((batch_size, num_objectives), device=device, generator=generator).abs()
+        lambda_ = lambda_ / lambda_.norm(dim=1, p=2, keepdim=True)
+    elif mode == "l1":
+        lambda_ = torch.randn((batch_size, num_objectives), device=device, generator=generator).abs()
+        lambda_ = lambda_ / lambda_.norm(dim=1, p=1, keepdim=True)
+    elif mode == "simplex":
+        feasible, p = check_n_feasibility(batch_size, num_objectives)
+        assert feasible, f"Cannot generate {batch_size} weight vectors for {num_objectives} objectives when using simplex."
+        lambda_inv = generate_simplex_lattice_weights(num_objectives, p, device=device).clamp(min=1e-7)
+        lambda_ = 1.0 / lambda_inv
+        lambda_ = lambda_ / lambda_.sum(dim=1, keepdim=True)
+
+    return lambda_
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -128,11 +249,11 @@ if __name__ == "__main__":
     parser.add_argument('--sub_batch_size', type=int, default=4, help="Sub-batch size for sampling, should be smaller than batch_size.") 
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--shift_constants', type=str, default="best")
-    parser.add_argument('--lambda_normalization', type=str, default="l2")
-    parser.add_argument('--aggre_mode', type=str, default="max")
+    parser.add_argument('--shift_constants', type=str, default="0")
+    parser.add_argument('--lambda_mode', type=str, default="l2")
+    parser.add_argument('--aggre_mode', type=str, default="neglogsumexp")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
-    parser.add_argument('--largest_frag', action='store_true', help="If set, only the largest fragment of the generated molecule will be kept.")
+    parser.add_argument('--with_noise', action='store_true', help="Whether to add noise to the generated ligands.")
 
     args = parser.parse_args()
     seed = args.seed
@@ -141,11 +262,11 @@ if __name__ == "__main__":
     if args.diversify_from_timestep == -1:
         args.diversify_from_timestep = None
 
-    is_filter_atom = "t" if args.largest_frag else "f"
+    with_noise_str = "t" if args.with_noise else "f"
 
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-ag={args.aggre_mode}-fil={is_filter_atom}-s={seed}-c={args.shift_constants}-{args.lambda_normalization}-{args.objective}",
+        name=f"sample-and-select-ag={args.aggre_mode}-c={args.shift_constants}-n={with_noise_str}-l={args.lambda_mode}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
         config=args,
     )
 
@@ -176,6 +297,8 @@ if __name__ == "__main__":
     
     torch.manual_seed(seed)
 
+    lambda_ = get_lambda(batch_size, num_objectives, args.lambda_mode, device)
+
     shift_constants = torch.zeros((num_objectives,), dtype=torch.float32, device=device)
     if is_number(args.shift_constants):
         shift_constants[:] = float(args.shift_constants)
@@ -185,137 +308,116 @@ if __name__ == "__main__":
         shift_constants[:] = float('-inf')
     elif args.shift_constants == "mean":
         shift_constants[:] = 0.0
+    
     else:
         raise ValueError(f"Unknown shift_constants: {args.shift_constants}")
     
-    lambda_ = torch.randn((batch_size, num_objectives), device=device, generator=generator).abs()
-    if args.lambda_normalization == "l2":
-        lambda_ = lambda_ / lambda_.norm(dim=1, p=2, keepdim=True)
-    elif args.lambda_normalization == "l1":
-        lambda_ = lambda_ / lambda_.norm(dim=1, p=1, keepdim=True)
     @torch.inference_mode()
-    def callback_func(pred_z0_lig, s, lig_mask, pocket, xh_pocket):
+    def callback_func(mu_ts_lig, xh_pocket_t, s, lig_mask, pocket):
         """
         Callback function to be used during sampling.
         For each predicted z0, it generates a sub-batch of samples by noising z0 to zt
         and then taking one denoising step to zs.
         A selection mechanism should be implemented to choose one `zs` for each original molecule.
         """
-        device = pred_z0_lig.device
 
-        # 1. Expand the batch for sub-sampling
-        num_nodes_lig = torch.unique(lig_mask, return_counts=True)[1]
-        current_batch_size = len(num_nodes_lig)
-
-        pred_z0_lig_list = utils.batch_to_list(pred_z0_lig, lig_mask)
-        xh_pocket_list = utils.batch_to_list(xh_pocket, pocket['mask'])
-        num_nodes_pocket = torch.unique(pocket['mask'], return_counts=True)[1]
-
-        # `pocket` is the dictionary of clean pocket data (t=0)
-        xh0_pocket = torch.cat([pocket['x'], pocket['one_hot']], dim=1)
-        xh0_pocket_list = utils.batch_to_list(xh0_pocket, pocket['mask'])
-
-        # Repeat each molecule's data `sub_batch_size` times
-        expanded_pred_z0_lig = torch.cat([p for p in pred_z0_lig_list for _ in range(sub_batch_size)], dim=0)
-        expanded_xh_pocket = torch.cat([p for p in xh_pocket_list for _ in range(sub_batch_size)], dim=0)
-        expanded_xh0_pocket = torch.cat([p for p in xh0_pocket_list for _ in range(sub_batch_size)], dim=0)
-        expanded_pocket_x = torch.cat([pocket['x'] for _ in range(sub_batch_size)], dim=0)
-
-        # Create new masks for the expanded batch
-        new_batch_size = current_batch_size * sub_batch_size
-        new_num_nodes_lig = num_nodes_lig.repeat_interleave(sub_batch_size)
-        new_lig_mask = utils.num_nodes_to_batch_mask(new_batch_size, new_num_nodes_lig, device=device)
-        new_num_nodes_pocket = num_nodes_pocket.repeat_interleave(sub_batch_size)
-        new_pocket_mask = utils.num_nodes_to_batch_mask(new_batch_size, new_num_nodes_pocket, device=device)
-
-        # 2. For each predicted z0, create `sub_batch_size` noised versions `zt_given_z0` at time t=s+1
-        t_int = s + 1
-        t_array = torch.full((new_batch_size, 1), fill_value=t_int, device=device) / model.ddpm.T
-        gamma_t = model.ddpm.inflate_batch_array(model.ddpm.gamma(t_array), expanded_pred_z0_lig)
-
-        zt_lig, _, _ = model.ddpm.noised_representation(
-            xh_lig=expanded_pred_z0_lig, xh0_pocket=expanded_xh0_pocket,
-            lig_mask=new_lig_mask, pocket_mask=new_pocket_mask, gamma_t=gamma_t
-        )
-
-        zt_lig_to_be_returned = zt_lig.clone()
-        xh_pocket_to_be_returned = expanded_xh_pocket.clone()
-
-        x0_given_zt_lig, h0_given_zt_lig, x_pocket, h_pocket = zt_to_z0(zt_lig, expanded_xh_pocket, new_lig_mask, new_pocket_mask, t_int, model)
+        device = mu_ts_lig.device
         
-        x0_given_zt_lig = shift_x_lig_back_to_pocket_com_before(x0_given_zt_lig, new_lig_mask, expanded_pocket_x, x_pocket, new_pocket_mask)
+        pocket_mask = pocket["mask"]
+        original_pocket = pocket["x"]
+        num_nodes_lig = torch.unique(lig_mask, return_counts=True)[1]
+        batch_size = len(num_nodes_lig)
+
+        t = s + 1
+        t_array = torch.full((batch_size, 1), fill_value=t, device=device) / model.ddpm.T
+        s_array = torch.full((batch_size, 1), fill_value=s, device=device) / model.ddpm.T
+
+        
+        zs_all = []
+        xh_pocket_s_all = []
+
+        xh_given_zs_all = []
+        lig_mask_all = []
+        pocket_mask_all = []
+        for sb in range(sub_batch_size):
+
+            zs, xh_pocket_s = mu_ts_to_zs(mu_ts_lig, xh_pocket_t, lig_mask, pocket_mask, t_array, s_array, model)
+            
+            # To be selected and returned
+            zs_all.append(zs)
+            xh_pocket_s_all.append(xh_pocket_s)
+
+            x_lig, h_lig, x_pocket_s, h_pocket_s = zt_to_xh(zs, xh_pocket_s, lig_mask, pocket_mask, s_array, model, with_noise=args.with_noise)
+            x_lig = shift_x_lig_back_to_pocket_com_before(
+                x_lig = x_lig,
+                lig_mask = lig_mask,
+                original_pocket = original_pocket,
+                new_pocket = x_pocket_s,
+                pocket_mask = pocket_mask
+            )
+
+            # To be evaluated for selection
+            xh = torch.cat([x_lig, h_lig], dim=1)
+            xh_given_zs_all.append(xh)
+            lig_mask_all.append(lig_mask + batch_size * sb)
+            pocket_mask_all.append(pocket_mask + batch_size * sb)
+        
+        zs_all = torch.cat(zs_all, dim=0)
+        xh_pocket_s_all = torch.cat(xh_pocket_s_all, dim=0)
+        xh_given_zs_all = torch.cat(xh_given_zs_all, dim=0)
+        lig_mask_all = torch.cat(lig_mask_all, dim=0)
+        pocket_mask_all = torch.cat(pocket_mask_all, dim=0)
 
         ############################################################
         # Build molecules from x0_given_zt_lig and h0_given_zt_lig #
         ############################################################
 
-        atom_type = torch.argmax(h0_given_zt_lig, dim=1)
-
         molecules = []
-        for mol_pc in zip(utils.batch_to_list(x0_given_zt_lig.cpu(), new_lig_mask),
-                            utils.batch_to_list(atom_type.cpu(), new_lig_mask)):
-
+        for mol_pc in zip(
+            utils.batch_to_list(xh_given_zs_all[:,:3].cpu(), lig_mask_all),
+            utils.batch_to_list(xh_given_zs_all[:,3:].argmax(dim=1).cpu(), lig_mask_all)
+        ):
             mol = build_molecule(mol_pc[0], mol_pc[1], model.dataset_info, add_coords=True)
             mol = process_molecule(mol,
                                     add_hydrogens=False,
-                                    sanitize=True,
+                                    sanitize=False,
                                     relax_iter=(200 if args.relax else 0),
-                                    largest_frag=args.largest_frag)
-            if mol is not None:
-                molecules.append(mol)
-            else:
-                molecules.append(None)
-
-        success_indices = []
-        success_molecules = []
-        for i, mol in enumerate(molecules):
-            if mol is not None:
-                success_indices.append(i)
-                success_molecules.append(mol)
-        
-        multi_objective_values = torch.full(
-            (len(molecules), num_objectives), 
-            float('inf'), 
-            device=device, 
-            dtype=FLOAT_TYPE
-        )
+                                    largest_frag=False)
+            molecules.append(mol)
 
         # [successful_objective_values] lower is better
-        successful_raw_metrics, successful_objective_values = objective_fn(success_molecules)
-        multi_objective_values[success_indices, :] = successful_objective_values.to(device)
-        raw_metrics = [None] * len(molecules)
-        for i, m in zip(success_indices, successful_raw_metrics):
-            raw_metrics[i] = m
+        raw_metrics, objective_values = objective_fn(molecules)
+        objective_values = objective_values.to(device)
 
         if args.shift_constants == "best":                
-            shift_constants[:] = torch.minimum(shift_constants, multi_objective_values.min(dim=0).values)
+            shift_constants[:] = torch.minimum(shift_constants, objective_values.min(dim=0).values)
         elif args.shift_constants == "worst":
-            shift_constants[:] = torch.maximum(shift_constants, multi_objective_values.max(dim=0).values)
+            shift_constants[:] = torch.maximum(shift_constants, objective_values.max(dim=0).values)
         elif args.shift_constants == "mean":
-            shift_constants[:] = multi_objective_values.mean(dim=0)
-
+            shift_constants[:] = objective_values[~objective_values.isinf().any(dim=1)].mean(dim=0)
+        
         select_indices = []
         select_lig_mask = []
         select_pocket_mask = []
-        multi_objective_values_candidates = multi_objective_values.clone()
+        objective_values_candidates = objective_values.clone()
         for i in range(batch_size):
             lambda_i = lambda_[i, :]
-            aggregated_objective_values = aggregate_objectives(multi_objective_values_candidates, shift_constants, lambda_i, mode=args.aggre_mode)
+            aggregated_objective_values = aggregate_objectives(objective_values_candidates, shift_constants, lambda_i, mode=args.aggre_mode)
             select_index = aggregated_objective_values.argmin().item()
-            multi_objective_values_candidates[select_index, :] = float('inf')  # Mark as used
+            objective_values_candidates[select_index, :] = float('inf')  # Mark as used
 
             select_indices.append(select_index)
-            select_lig_mask.append( (new_lig_mask == select_index).nonzero().squeeze(1) )
-            select_pocket_mask.append( (new_pocket_mask == select_index).nonzero().squeeze(1) )
-        del multi_objective_values_candidates
+            select_lig_mask.append( (lig_mask_all == select_index).nonzero().squeeze(1) )
+            select_pocket_mask.append( (pocket_mask_all == select_index).nonzero().squeeze(1) )
+        del objective_values_candidates
         select_lig_mask = torch.stack(select_lig_mask).flatten()
         select_pocket_mask = torch.stack(select_pocket_mask).flatten()
 
-        selected_zt_lig = zt_lig_to_be_returned[select_lig_mask]
-        selected_xh_pocket = xh_pocket_to_be_returned[select_pocket_mask]
+        selected_zs_lig = zs_all[select_lig_mask]
+        selected_xh_pocket_s = xh_pocket_s_all[select_pocket_mask]
 
         selected_molecules = [
-            EvaluatedMolecule(molecules[i], multi_objective_values[i], raw_metrics[i])
+            EvaluatedMolecule(molecules[i], objective_values[i], raw_metrics[i])
             for i in select_indices
         ]
 
@@ -325,34 +427,27 @@ if __name__ == "__main__":
             stage=f"intermediate",
         )
 
-        return {"z_lig": selected_zt_lig, "xh_pocket": selected_xh_pocket}
+        return {"z_lig": selected_zs_lig, "xh_pocket": selected_xh_pocket_s}
 
     with torch.inference_mode():
-        molecules, pred_z0_lig_traj = model.generate_ligands(
+        molecules = model.generate_ligands(
             args.pdbfile, batch_size, None, args.ref_ligand, ref_ligand,
-            num_nodes_lig, sanitize=True, largest_frag=args.largest_frag,
+            num_nodes_lig, sanitize=False, largest_frag=False,
             relax_iter=(200 if args.relax else 0),
             diversify_from_timestep=args.diversify_from_timestep,
-            callback=callback_func,
+            # callback=callback_func,
         )
     assert len(molecules) == batch_size
 
-    success_indices = []
-    success_molecules = []
-    for i, mol in enumerate(molecules):
-        if mol is not None:
-            success_indices.append(i)
-            success_molecules.append(mol)
-
     # [objective_values] lower is better
-    raw_metrics, objective_values = objective_fn(success_molecules)
-    selected_molecules = [
+    raw_metrics, objective_values = objective_fn(molecules)
+    evaluated_molecules = [
         EvaluatedMolecule(mol, obj_values, raw_metric)
-        for mol, obj_values, raw_metric in zip(success_molecules, objective_values, raw_metrics)
+        for mol, obj_values, raw_metric in zip(molecules, objective_values, raw_metrics)
     ]
     
     log_molecules_objective_values(
-        selected_molecules, 
+        evaluated_molecules, 
         objectives_feedbacks=objective_fn.objectives_consumption,
         stage=f"final",
     )

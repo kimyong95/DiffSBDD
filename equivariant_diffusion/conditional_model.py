@@ -126,8 +126,6 @@ class ConditionalDDPM(EnVariationalDiffusion):
         xh_lig, xh0_pocket = self.sample_normal_zero_com(
             mu_x_lig, xh0_pocket, sigma_x, lig_mask, pocket_mask, fix_noise, given_noise)
 
-        final_z0 = torch.cat([xh_lig[:, :self.n_dims], z0_lig[:, self.n_dims:]], dim=1)
-
         x_lig, h_lig = self.unnormalize(
             xh_lig[:, :self.n_dims], z0_lig[:, self.n_dims:])
         x_pocket, h_pocket = self.unnormalize(
@@ -136,7 +134,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
         h_lig = F.one_hot(torch.argmax(h_lig, dim=1), self.atom_nf)
         # h_pocket = F.one_hot(torch.argmax(h_pocket, dim=1), self.residue_nf)
 
-        return x_lig, h_lig, x_pocket, h_pocket, final_z0
+        return x_lig, h_lig, x_pocket, h_pocket
 
     def sample_normal(self, *args):
         raise NotImplementedError("Has been replaced by sample_normal_zero_com()")
@@ -448,8 +446,6 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
 
-        pred_z0_lig_traj = []
-
         for i, s in enumerate(reversed(range(0, noising_steps))):
             s_array = torch.full((n_samples, 1), fill_value=s,
                                  device=z_lig.device)
@@ -457,34 +453,28 @@ class ConditionalDDPM(EnVariationalDiffusion):
             s_array = s_array / timesteps
             t_array = t_array / timesteps
 
-            z_lig, xh_pocket, pred_z0_lig = self.sample_p_zs_given_zt(
+            xh_pocket_t = xh_pocket.detach().clone()
+            z_lig, xh_pocket, mu_lig = self.sample_p_zs_given_zt(
                 s_array, t_array, z_lig.detach(), xh_pocket.detach(), lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
 
-            if callback is not None and s > 0:
-                next_s = s - 1
-                callback_out = callback(pred_z0_lig=pred_z0_lig, s=next_s, lig_mask=lig_mask, pocket=pocket, xh_pocket=xh_pocket)
+            if callback is not None:
+                # The z_lig will not be used, instead we will use the mu_lig and xh_pocket_old to obtain and select the new z_lig
+                callback_out = callback(mu_ts_lig=mu_lig, xh_pocket_t=xh_pocket_t, s=s, lig_mask=lig_mask, pocket=pocket)
                 z_lig = callback_out["z_lig"] if "z_lig" in callback_out else z_lig
                 xh_pocket = callback_out["xh_pocket"] if "xh_pocket" in callback_out else xh_pocket
 
-            pred_z0_lig_traj.append(pred_z0_lig)
-
-        pred_z0_lig_traj.append(z_lig)
-
         # Finally sample p(x, h | z_0).
-        x_lig, h_lig, x_pocket, h_pocket, z0_final = self.sample_p_xh_given_z0(
+        x_lig, h_lig, x_pocket, h_pocket = self.sample_p_xh_given_z0(
             z_lig, xh_pocket, lig_mask, pocket['mask'], n_samples, given_noise=given_noise_list[noising_steps + 1])
-        
-        pred_z0_lig_traj.append(z0_final)
         
         self.assert_mean_zero_with_mask(x_lig, lig_mask)
 
         # Overwrite last frame with the resulting x and h.
         out_lig = torch.cat([x_lig, h_lig], dim=1)
         out_pocket = torch.cat([x_pocket, h_pocket], dim=1)
-        pred_z0_lig_traj = torch.stack(pred_z0_lig_traj, dim=0)
 
         # remove frame dimension if only the final molecule is returned
-        return out_lig, out_pocket, lig_mask, pocket['mask'], pred_z0_lig_traj
+        return out_lig, out_pocket, lig_mask, pocket['mask']
 
 
     def xh_given_zt_and_epsilon(self, z_t, epsilon, gamma_t, batch_mask):
@@ -541,11 +531,10 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         self.assert_mean_zero_with_mask(zt_lig[:, :self.n_dims], ligand_mask)
 
-        pred_z0_lig = self.compute_x_pred(eps_t_lig, zt_lig, gamma_t, ligand_mask)
+        # TODO: Commented for MOO, check the BDTG compatibility
+        # pred_z0_lig[:, :self.n_dims], _ = self.remove_mean_batch(pred_z0_lig[:, :self.n_dims], xh0_pocket[:, :self.n_dims], ligand_mask, pocket_mask)
 
-        pred_z0_lig[:, :self.n_dims], _ = self.remove_mean_batch(pred_z0_lig[:, :self.n_dims], xh0_pocket[:, :self.n_dims], ligand_mask, pocket_mask)
-
-        return zs_lig, xh0_pocket, pred_z0_lig
+        return zs_lig, xh0_pocket, mu_lig
 
     def sample_combined_position_feature_noise(self, lig_indices, xh0_pocket,
                                                pocket_indices):
@@ -606,12 +595,12 @@ class ConditionalDDPM(EnVariationalDiffusion):
             s_array = s_array / timesteps
             t_array = t_array / timesteps
 
-            z_lig, xh_pocket, pred_z0_lig = self.sample_p_zs_given_zt(
+            z_lig, xh_pocket, mu_lig = self.sample_p_zs_given_zt(
                 s_array, t_array, z_lig, xh_pocket, lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
 
             if callback is not None and s > 0:
                 next_s = s-1
-                callback_out = callback(pred_z0_lig=pred_z0_lig, s=next_s, lig_mask=lig_mask, pocket=pocket, xh_pocket=xh_pocket)
+                callback_out = callback(mu_lig=mu_lig, s=next_s, lig_mask=lig_mask, pocket=pocket, xh_pocket=xh_pocket)
                 z_lig = callback_out["z_lig"] if "z_lig" in callback_out else z_lig
                 xh_pocket = callback_out["xh_pocket"] if "xh_pocket" in callback_out else xh_pocket
 
@@ -622,7 +611,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
                     self.unnormalize_z(z_lig, xh_pocket)
 
         # Finally sample p(x, h | z_0).
-        x_lig, h_lig, x_pocket, h_pocket, _ = self.sample_p_xh_given_z0(
+        x_lig, h_lig, x_pocket, h_pocket = self.sample_p_xh_given_z0(
             z_lig, xh_pocket, lig_mask, pocket['mask'], n_samples)
 
         self.assert_mean_zero_with_mask(x_lig, lig_mask)
@@ -776,6 +765,7 @@ class ConditionalDDPM(EnVariationalDiffusion):
                pocket['mask']
 
     @classmethod
+    # Move x_lig and x_pocket togather, such that the center mass of x_lig is zero.
     def remove_mean_batch(cls, x_lig, x_pocket, lig_indices, pocket_indices):
 
         # Just subtract the center of mass of the sampled part

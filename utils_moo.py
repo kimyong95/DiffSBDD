@@ -6,6 +6,7 @@ from rdkit import Chem
 from rdkit.DataStructs import BulkTanimotoSimilarity
 from rdkit.Chem import AllChem
 from pymoo.indicators.hv import HV
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from objective import METRIC_MAXIMIZE
 
 class EvaluatedMolecule:
@@ -102,7 +103,7 @@ def calculate_molecules_diversity(molecules: List[Chem.Mol]) -> float:
     
     return diversity
 
-def get_pareto_front(objective_values):
+def get_num_pareto_front(objective_values):
     """
     Computes the Pareto front from a set of multi-objective values.
 
@@ -114,19 +115,10 @@ def get_pareto_front(objective_values):
     Returns:
         torch.Tensor: A tensor containing the points on the Pareto front.
     """
-    if objective_values.numel() == 0:
-        return torch.empty(0, objective_values.shape[1], device=objective_values.device, dtype=objective_values.dtype)
+    nds = NonDominatedSorting()
+    
 
-    is_pareto = torch.ones(objective_values.shape[0], dtype=torch.bool, device=objective_values.device)
-    for i in range(objective_values.shape[0]):
-        # A point is on the Pareto front if no other point dominates it.
-        # A point `j` dominates point `i` if `j` is better or equal in all objectives
-        # and strictly better in at least one.
-        dominators = (objective_values <= objective_values[i]).all(dim=1) & (objective_values < objective_values[i]).any(dim=1)
-        if dominators.any():
-            is_pareto[i] = False
-            
-    return objective_values[is_pareto]
+    return len(nds.do(objective_values.cpu().numpy())[0])
 
 
 def log_molecules_objective_values(evaluated_molecules: List[EvaluatedMolecule], objectives_feedbacks, stage, commit=True):
@@ -138,16 +130,17 @@ def log_molecules_objective_values(evaluated_molecules: List[EvaluatedMolecule],
 
     molecules_diversity = calculate_molecules_diversity(buffer_molecules)
     hypervolume = calculate_hypervolume(buffer_objective_values)
-    pareto_front = get_pareto_front(buffer_objective_values)
+    num_pareto_front = get_num_pareto_front(buffer_objective_values)
 
     log_dict = {
         "objectives_feedbacks": objectives_feedbacks,
         f"{stage}/diversity": molecules_diversity,
         f"{stage}/hypervolume": hypervolume,
-        f"{stage}/number_of_pareto": len(pareto_front),
+        f"{stage}/number_of_pareto": num_pareto_front,
     }
     for metric in metrics:
         metric_tensor = torch.tensor([mol.raw_metrics[metric] for mol in evaluated_molecules])
+        metric_tensor = metric_tensor[~metric_tensor.isnan()]
         log_dict[f"{stage}/{metric}_mean"] = metric_tensor.mean()
         log_dict[f"{stage}/{metric}_best"] = metric_tensor.max() if METRIC_MAXIMIZE[metric] else metric_tensor.min()
     wandb.log(log_dict, commit=commit)

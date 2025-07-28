@@ -841,8 +841,7 @@ class LigandPocketDDPM(pl.LightningModule):
                 self.ddpm.sample_given_pocket(pocket, num_nodes_lig,
                                               timesteps=timesteps, callback=callback, **kwargs)
         elif type(self.ddpm) == ConditionalDDPM and diversify_from_timestep is not None:
-            xh_lig, xh_pocket, lig_mask, pocket_mask, pred_z0_lig_traj = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_timestep, callback=callback, **kwargs)
-            pred_z0_lig_traj = torch.stack([ torch.stack(list(utils.batch_to_list(pred_z0_lig, lig_mask))) for pred_z0_lig in pred_z0_lig_traj ])
+            xh_lig, xh_pocket, lig_mask, pocket_mask = self.ddpm.diversify(ref_ligand, pocket, noising_steps=diversify_from_timestep, callback=callback, **kwargs)
         else:
             raise NotImplementedError
 
@@ -875,7 +874,7 @@ class LigandPocketDDPM(pl.LightningModule):
             else:
                 molecules.append(None)
 
-        return molecules, pred_z0_lig_traj
+        return molecules
 
     def configure_gradient_clipping(self, optimizer, optimizer_idx,
                                     gradient_clip_val, gradient_clip_algorithm):

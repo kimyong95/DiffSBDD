@@ -41,6 +41,8 @@ def retry(tries=4, delay=3, backoff=2):
             while mtries > 1:
                 try:
                     return func(*args, **kwargs)
+                except KeyboardInterrupt:
+                    raise
                 except Exception as e:
                     print(f"'{func.__name__}' failed with '{e}'. Retrying in {mdelay} seconds...")
                     time.sleep(mdelay)

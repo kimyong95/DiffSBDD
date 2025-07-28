@@ -2,6 +2,7 @@ from sbdd_metrics.metrics import FullEvaluator
 from typing import List
 from collections import defaultdict
 import torch
+from rdkit import Chem
 METRIC_EVALUATOR_MAP = { "qed": "medchem", "sa": "medchem", "reos": "reos", "vina": "gnina", "gnina": "gnina" }
 
 # True means maximize
@@ -36,19 +37,31 @@ class Objective:
     # - normalized_objective_values: tensor of (N, K), lower is better, roughly in [0, 1] range
     def __call__(self, molecules):
 
-        normalized_objective_values = torch.zeros((len(molecules), len(self.metrics)))
-        raw_metrics = []
         
-        # mol_results = []
-        # for molecule in molecules:
-        #     mol_results.append(self.evaluator.evaluate(molecule, protein=self.pocket_pdbfile))
+        raw_metrics = []
 
-        mol_results = self.evaluator.evaluate_batch(molecules, proteins=[self.pocket_pdbfile]*len(molecules))
+        molecules = [self.preprocess_molecule(mol) for mol in molecules]
+        valid_indices, valid_molecules = list(zip(*[(i,mol) for i, mol in enumerate(molecules) if mol is not None]))
 
+        # valid_mol_results = []
+        # for molecule in valid_molecules:
+        #     valid_mol_results.append(self.evaluator.evaluate(molecule, protein=self.pocket_pdbfile))
+
+        valid_mol_results = self.evaluator.evaluate_batch(valid_molecules, proteins=[self.pocket_pdbfile]*len(valid_molecules))
+
+        mol_results = [None] * len(molecules)
+        for i, idx in enumerate(valid_indices):
+            mol_results[idx] = valid_mol_results[i]
+
+        normalized_objective_values = torch.full((len(molecules), len(self.metrics)), float('inf'))
+        
         for i, mol_result in enumerate(mol_results):
             raw_metric = {}
             for j, metric in enumerate(self.metrics):
-                raw_value, normalized_obj_value = self.get_objective_values(mol_result, metric)
+                if mol_result is not None:
+                    raw_value, normalized_obj_value = self.get_objective_values(mol_result, metric)
+                else:
+                    raw_value, normalized_obj_value = float('nan'), float('inf')
                 normalized_objective_values[i, j] = normalized_obj_value
                 raw_metric[metric] = raw_value
             raw_metrics.append(raw_metric)
@@ -56,6 +69,22 @@ class Objective:
         self.objectives_consumption += len(molecules)
 
         return raw_metrics, normalized_objective_values
+
+    def preprocess_molecule(self, mol):
+        try:
+            Chem.SanitizeMol(mol)
+        except ValueError as e:
+            return None
+
+        mol_frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=False)
+        mol = max(mol_frags, default=mol, key=lambda m: m.GetNumAtoms())
+        # sanitize the updated molecule
+        try:
+            Chem.SanitizeMol(mol)
+        except ValueError as e:
+            return None
+
+        return mol
     
     # Input: raw metric value (could be None)
     # Output:

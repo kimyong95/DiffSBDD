@@ -84,13 +84,12 @@ if __name__ == "__main__":
     parser.add_argument('--objective', type=str, default='qed')
     parser.add_argument('--timesteps', type=int, default=100)
     parser.add_argument('--population_size', type=int, default=32)
-    parser.add_argument('--evolution_steps', type=int, default=300)
+    parser.add_argument('--evolution_steps', type=int, default=1000)
     parser.add_argument('--outfile', type=Path, default='output.sdf')
     parser.add_argument('--relax', action='store_true')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--mode', type=str, default='egd', choices=['egd', 'sbdd-ea'])
     parser.add_argument('--sbdd_top_k', type=int, default=4)
-    parser.add_argument('--largest_frag', action='store_true', help="If set, only the largest fragment of the generated molecule will be kept.")
 
 
     args = parser.parse_args()
@@ -98,11 +97,10 @@ if __name__ == "__main__":
     seed_everything(seed)
 
     name_str = args.mode
-    is_filter_atom = "t" if args.largest_frag else "f"
 
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"{name_str}-fil={is_filter_atom}-s{seed}-{args.objective}",
+        name=f"{name_str}-o={args.objective}-s{seed}",
         config=args,
     )
 
@@ -152,9 +150,9 @@ if __name__ == "__main__":
                     ref_ligand=ligands_to_diversify,
                     n_samples=len(molecules_to_diversify),
                     diversify_from_timestep=args.timesteps,
-                    sanitize=True,
+                    sanitize=False,
                     relax_iter=(200 if args.relax else 0),
-                    largest_frag=args.largest_frag,
+                    largest_frag=False,
                     crossover=True
                 )
             elif args.mode == 'sbdd-ea':
@@ -165,20 +163,18 @@ if __name__ == "__main__":
                     ref_ligand=ligands_to_diversify,
                     n_samples=len(molecules_to_diversify),
                     diversify_from_timestep=args.timesteps,
-                    sanitize=True,
+                    sanitize=False,
                     relax_iter=(200 if args.relax else 0),
-                    largest_frag=args.largest_frag,
+                    largest_frag=False,
                     crossover=False
                 )
         
-        successful_molecules = [mol for mol in diversified_molecules if mol is not None]
-        
         # 2. Evaluate, select, and update buffer
-        raw_metrics, objective_values = objective_fn(successful_molecules)
+        raw_metrics, objective_values = objective_fn(diversified_molecules)
 
         candicates = [
             EvaluatedMolecule(mol, obj_values, raw_metric)
-            for mol, obj_values, raw_metric in zip(successful_molecules, objective_values, raw_metrics)
+            for mol, obj_values, raw_metric in zip(diversified_molecules, objective_values, raw_metrics)
         ]
 
         log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="candidates", commit=False)
