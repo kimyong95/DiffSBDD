@@ -246,13 +246,14 @@ if __name__ == "__main__":
     parser.add_argument('--relax', action='store_true')
     parser.add_argument('--objective', type=str, default="sa;qed;vina")
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--sub_batch_size', type=int, default=2, help="Sub-batch size for sampling, should be smaller than batch_size.") 
+    parser.add_argument('--sub_batch_size', type=int, default=4, help="Sub-batch size for sampling, should be smaller than batch_size.") 
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--shift_constants', type=str, default="0")
     parser.add_argument('--lambda_mode', type=str, default="l2")
     parser.add_argument('--aggre_mode', type=str, default="neglogsumexp")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
+    parser.add_argument('--refresh_lambda', action='store_true', help="Refresh lambda every step")
 
     args = parser.parse_args()
     seed = args.seed
@@ -261,9 +262,11 @@ if __name__ == "__main__":
     if args.diversify_from_timestep == -1:
         args.diversify_from_timestep = None
 
+    refresh_lambda = "t" if args.refresh_lambda else "f"
+
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-ag={args.aggre_mode}-c={args.shift_constants}-l={args.lambda_mode}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
+        name=f"sample-and-select-c={args.shift_constants}-rl={refresh_lambda}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
         config=args,
     )
 
@@ -389,13 +392,17 @@ if __name__ == "__main__":
         if args.shift_constants == "best":                
             shift_constants[:] = torch.minimum(shift_constants, objective_values.min(dim=0).values)
         elif args.shift_constants == "worst":
-            shift_constants[:] = torch.maximum(shift_constants, objective_values.max(dim=0).values)
+            objective_values_finite = objective_values[~objective_values.isinf().any(dim=1)]
+            shift_constants[:] = torch.maximum(shift_constants, objective_values_finite.max(dim=0).values)
         elif args.shift_constants == "mean":
             shift_constants[:] = objective_values[~objective_values.isinf().any(dim=1)].mean(dim=0)
         
         select_indices = []
         select_lig_mask = []
         select_pocket_mask = []
+        global lambda_
+        if args.refresh_lambda:
+            lambda_ = get_lambda(batch_size, num_objectives, args.lambda_mode, device)            
         objective_values_candidates = objective_values.clone()
         for i in range(batch_size):
             lambda_i = lambda_[i, :]
