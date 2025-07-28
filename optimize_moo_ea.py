@@ -27,6 +27,7 @@ from constants import FLOAT_TYPE, INT_TYPE
 from analysis.molecule_builder import build_molecule, process_molecule
 from analysis.metrics import MoleculeProperties
 from sbdd_metrics.metrics import FullEvaluator
+from pyMultiobjective.algorithm import s_ii
 
 from utils_moo import EvaluatedMolecule, log_molecules_objective_values
 
@@ -74,6 +75,104 @@ def prepare_substructure(ref_ligand, fix_atoms, pdb_model):
     return coord, one_hot
 
 
+def spea2(objective_values: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates the SPEA2 fitness for a given set of objective values.
+
+    Args:
+        objective_values (np.array): A Pytorch tensor of shape (N, K), where N is the
+                                     number of solutions and K is the number of objectives.
+                                     It's assumed that lower values are better (minimization).
+
+    Returns:
+        np.array: A Pytorch tensor of shape (N,), containing the calculated fitness
+                  value for each of the N solutions.
+    """
+    device = objective_values.device
+    objective_values = objective_values.cpu().numpy()
+
+    if not isinstance(objective_values, np.ndarray) or objective_values.ndim != 2:
+        raise ValueError("Input 'objective_values' must be a 2D NumPy array.")
+
+    n_solutions, n_objectives = objective_values.shape
+    
+    # --------------------------------------------------------------------------
+    # 1. Calculate Raw Fitness (R)
+    # --------------------------------------------------------------------------
+    
+    # Step 1.1: Calculate Strength (S) for each solution
+    # Strength S(i) = number of solutions that solution i dominates.
+    strength = np.zeros(n_solutions)
+    for i in range(n_solutions):
+        dominates_count = 0
+        for j in range(n_solutions):
+            if i == j:
+                continue
+            if s_ii.dominance_function(objective_values[i, :], objective_values[j, :]):
+                dominates_count += 1
+        strength[i] = dominates_count
+
+    # Step 1.2: Calculate Raw Fitness (R)
+    # Raw Fitness R(i) = sum of strengths of all solutions that dominate solution i.
+    raw_fitness = np.zeros(n_solutions)
+    for i in range(n_solutions):
+        dominator_strength_sum = 0
+        for j in range(n_solutions):
+            if i == j:
+                continue
+            # Check if solution j dominates solution i
+            if s_ii.dominance_function(objective_values[j, :], objective_values[i, :]):
+                dominator_strength_sum += strength[j]
+        raw_fitness[i] = dominator_strength_sum
+        
+    # --------------------------------------------------------------------------
+    # 2. Calculate Density (D)
+    # --------------------------------------------------------------------------
+    
+    # Step 2.1: Calculate pairwise Euclidean distances in the objective space
+    distance_matrix = s_ii.euclidean_distance(objective_values)
+    
+    # Step 2.2: Calculate k for k-th nearest neighbor
+    # Handle case where n_solutions is too small
+    k = int(np.sqrt(n_solutions)) -1
+    if k < 0:
+        k = 0 # If N is 1, 2, or 3, k will be 0, meaning the nearest neighbor.
+    
+    # Step 2.3: Calculate density D(i) = 1 / (sigma_k + 2)
+    density = np.zeros(n_solutions)
+    for i in range(n_solutions):
+        # Sort distances for the current solution i to all other solutions
+        sorted_distances = np.sort(distance_matrix[i, :])
+        
+        # The first element is always 0 (distance to self), so we look at index k+1
+        # However, the original s_ii.py implementation has a slight difference.
+        # Let's stick to the logic of finding the k-th nearest *other* point.
+        # If we sort all distances, sorted_distances[0] is d(i,i)=0.
+        # The nearest neighbor is at sorted_distances[1].
+        # The k-th nearest neighbor is at sorted_distances[k].
+        # The s_ii.py code is a bit different, but this is the standard interpretation.
+        # Let's check the original code's logic again:
+        # distance_ordered = (distance[distance[:,i].argsort()]).T
+        # fitness[i,0] = raw_fitness[i,0] + 1/(distance_ordered[i,k] + 2)
+        # This sorts distances *to* i, then picks the k-th value. It's equivalent.
+        
+        # Ensure k is a valid index
+        if k < len(sorted_distances):
+            sigma_k = sorted_distances[k]
+        else: # Fallback for very small populations
+            sigma_k = sorted_distances[-1]
+
+        density[i] = 1 / (sigma_k + 2)
+        
+    # --------------------------------------------------------------------------
+    # 3. Calculate Final Fitness F = R + D
+    # --------------------------------------------------------------------------
+    final_fitness = raw_fitness + density
+
+    final_fitness_torch = torch.from_numpy(final_fitness).to(device=device)
+    
+    return final_fitness_torch
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
@@ -81,7 +180,7 @@ if __name__ == "__main__":
     parser.add_argument('--pdbfile', type=str, default='example/5ndu.pdb')
     parser.add_argument('--pocket_pdbfile', type=str, default='example/5ndu_pocket.pdb')
     parser.add_argument('--ref_ligand', type=str, default='example/5ndu_C_8V2.sdf')
-    parser.add_argument('--objective', type=str, default='qed')
+    parser.add_argument('--objective', type=str, default="sa;qed;vina")
     parser.add_argument('--timesteps', type=int, default=100)
     parser.add_argument('--population_size', type=int, default=32)
     parser.add_argument('--evolution_steps', type=int, default=1000)
@@ -90,7 +189,6 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--mode', type=str, default='egd', choices=['egd', 'sbdd-ea'])
     parser.add_argument('--sbdd_top_k', type=int, default=4)
-
 
     args = parser.parse_args()
     seed = args.seed
@@ -144,7 +242,7 @@ if __name__ == "__main__":
                 # Crossover will double the batch size
                 molecules_to_diversify = molecules_to_diversify + molecules_to_diversify
                 ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
-                diversified_molecules, _ = model.generate_ligands(
+                diversified_molecules = model.generate_ligands(
                     pdb_file=args.pdbfile,
                     ref_ligand_path=args.ref_ligand,
                     ref_ligand=ligands_to_diversify,
@@ -157,7 +255,7 @@ if __name__ == "__main__":
                 )
             elif args.mode == 'sbdd-ea':
                 ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
-                diversified_molecules, _ = model.generate_ligands(
+                diversified_molecules = model.generate_ligands(
                     pdb_file=args.pdbfile,
                     ref_ligand_path=args.ref_ligand,
                     ref_ligand=ligands_to_diversify,
@@ -182,11 +280,15 @@ if __name__ == "__main__":
         if args.mode == 'egd':
             # 3. Union with family, and select best molecules based on the objective values
             buffer.extend(candicates)
-            buffer = sorted(buffer, reverse=False)[:population_size]
+            fitness = spea2(torch.stack([c.objective_values for c in buffer]))
+            sorted_indices = torch.argsort(fitness, descending=False)
+            buffer = [buffer[i] for i in sorted_indices[:population_size]]
         elif args.mode == 'sbdd-ea':
             # 3. Drop the parents
             buffer = candicates
-            buffer = sorted(buffer, reverse=False)[:sbdd_top_k]
+            aggregated_objective_values = torch.stack([c.objective_values for c in buffer]).mean(dim=1)
+            sorted_indices = torch.argsort(fitness, descending=False)
+            buffer = [buffer[i] for i in sorted_indices[:sbdd_top_k]]
             while len(buffer) < population_size:
                 buffer.extend(buffer)
             buffer = buffer[:population_size]
