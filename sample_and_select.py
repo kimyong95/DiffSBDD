@@ -59,21 +59,21 @@ def mu_ts_to_zs(mu_lig, xh0_pocket, lig_mask, pocket_mask, t, s, model):
     # The zs_lig should have mean zero.
     return zs_lig, xh0_pocket
 
-def zt_to_xh(zt_lig, xh_pocket, lig_mask, pocket_mask, t, model, with_noise):
+def zt_to_xh(zt_lig, xh_pocket, lig_mask, pocket_mask, t, model):
 
-    batch_size = t.shape[0]
-    s0 = torch.zeros_like(t)
-    noise0 = torch.zeros_like(zt_lig) if not with_noise else None
-    
-    if t[0].item() > 0:
-        z0_lig, xh0_pocket, _ = model.ddpm.sample_p_zs_given_zt(s0, t, zt_lig, xh_pocket, lig_mask, pocket_mask, given_noise=noise0)
-        x_lig, h_lig, x_pocket, h_pocket = model.ddpm.sample_p_xh_given_z0(z0_lig, xh0_pocket, lig_mask, pocket_mask, batch_size, given_noise=noise0)
-    else:
-        x_lig, h_lig, x_pocket, h_pocket = model.ddpm.sample_p_xh_given_z0(zt_lig, xh_pocket , lig_mask, pocket_mask, batch_size, given_noise=noise0)
+    gamma_t = model.ddpm.gamma(t)
+    eps_t_lig, _ = model.ddpm.dynamics(zt_lig, xh_pocket, t, lig_mask, pocket_mask)
+    pred_x = model.ddpm.compute_x_pred(eps_t_lig, zt_lig, gamma_t, lig_mask)
+
+    xh_pocket_shifted = xh_pocket.clone()
+    pred_x[:,:3], xh_pocket_shifted[:,:3] = model.ddpm.remove_mean_batch(pred_x[:,:3], xh_pocket_shifted[:,:3], lig_mask, pocket_mask)
+
+    x_lig, h_lig = model.ddpm.unnormalize(pred_x[:, :3], pred_x[:, 3:])
+    x_pocket_shifted, h_pocket_shifted = model.ddpm.unnormalize(xh_pocket_shifted[:,:3], xh_pocket_shifted[:,3:])
 
     model.ddpm.assert_mean_zero_with_mask(x_lig, lig_mask)
 
-    return x_lig, h_lig, x_pocket, h_pocket
+    return x_lig, h_lig, x_pocket_shifted, h_pocket_shifted
 
 def shift_x_lig_back_to_pocket_com_before(
         x_lig, lig_mask,
@@ -253,7 +253,6 @@ if __name__ == "__main__":
     parser.add_argument('--lambda_mode', type=str, default="l2")
     parser.add_argument('--aggre_mode', type=str, default="neglogsumexp")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
-    parser.add_argument('--with_noise', action='store_true', help="Whether to add noise to the generated ligands.")
 
     args = parser.parse_args()
     seed = args.seed
@@ -262,11 +261,9 @@ if __name__ == "__main__":
     if args.diversify_from_timestep == -1:
         args.diversify_from_timestep = None
 
-    with_noise_str = "t" if args.with_noise else "f"
-
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-ag={args.aggre_mode}-c={args.shift_constants}-n={with_noise_str}-l={args.lambda_mode}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
+        name=f"sample-and-select-ag={args.aggre_mode}-c={args.shift_constants}-l={args.lambda_mode}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
         config=args,
     )
 
@@ -347,7 +344,7 @@ if __name__ == "__main__":
             zs_all.append(zs)
             xh_pocket_s_all.append(xh_pocket_s)
 
-            x_lig, h_lig, x_pocket_s, h_pocket_s = zt_to_xh(zs, xh_pocket_s, lig_mask, pocket_mask, s_array, model, with_noise=args.with_noise)
+            x_lig, h_lig, x_pocket_s, h_pocket_s = zt_to_xh(zs, xh_pocket_s, lig_mask, pocket_mask, s_array, model)
             x_lig = shift_x_lig_back_to_pocket_com_before(
                 x_lig = x_lig,
                 lig_mask = lig_mask,
