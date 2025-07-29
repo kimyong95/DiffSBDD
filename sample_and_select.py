@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from typing import List
-from utils_moo import EvaluatedMolecule, log_molecules_objective_values
+from utils_moo import EvaluatedMolecule, log_molecules_objective_values, generate_weight_vectors
 from rdkit import Chem
 
 from rdkit.Chem import AllChem
@@ -224,15 +224,19 @@ def get_lambda(batch_size: int, num_objectives: int, mode, device):
     if mode == "l2":
         lambda_ = torch.randn((batch_size, num_objectives), device=device, generator=generator).abs()
         lambda_ = lambda_ / lambda_.norm(dim=1, p=2, keepdim=True)
+    if mode == "l2":
+        lambda_ = torch.randn((batch_size, num_objectives), device=device, generator=generator).abs()
+        lambda_ = lambda_ / lambda_.norm(dim=1, p=2, keepdim=True)
     elif mode == "l1":
         lambda_ = torch.randn((batch_size, num_objectives), device=device, generator=generator).abs()
         lambda_ = lambda_ / lambda_.norm(dim=1, p=1, keepdim=True)
     elif mode == "simplex":
         feasible, p = check_n_feasibility(batch_size, num_objectives)
         assert feasible, f"Cannot generate {batch_size} weight vectors for {num_objectives} objectives when using simplex."
-        lambda_inv = generate_simplex_lattice_weights(num_objectives, p, device=device).clamp(min=1e-7)
-        lambda_ = 1.0 / lambda_inv
-        lambda_ = lambda_ / lambda_.sum(dim=1, keepdim=True)
+        lambda_ = generate_simplex_lattice_weights(num_objectives, p, device=device).clamp(min=1e-7)
+    elif mode == "deterministic_uniform":
+        lambda_ = generate_weight_vectors(batch_size, num_objectives)
+        lambda_ = torch.from_numpy(lambda_.T).to(device)
 
     return lambda_
 
@@ -253,7 +257,6 @@ if __name__ == "__main__":
     parser.add_argument('--lambda_mode', type=str, default="l2")
     parser.add_argument('--aggre_mode', type=str, default="neglogsumexp")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
-    parser.add_argument('--refresh_lambda', action='store_true', help="Refresh lambda every step")
 
     args = parser.parse_args()
     seed = args.seed
@@ -262,11 +265,9 @@ if __name__ == "__main__":
     if args.diversify_from_timestep == -1:
         args.diversify_from_timestep = None
 
-    refresh_lambda = "t" if args.refresh_lambda else "f"
-
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-c={args.shift_constants}-rl={refresh_lambda}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
+        name=f"sample-and-select-c={args.shift_constants}-l={args.lambda_mode}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
         config=args,
     )
 
@@ -306,11 +307,6 @@ if __name__ == "__main__":
         shift_constants[:] = float('inf')
     elif args.shift_constants == "worst":
         shift_constants[:] = float('-inf')
-    elif args.shift_constants == "mean":
-        shift_constants[:] = 0.0
-    
-    else:
-        raise ValueError(f"Unknown shift_constants: {args.shift_constants}")
     
     @torch.inference_mode()
     def callback_func(mu_ts_lig, xh_pocket_t, s, lig_mask, pocket):
@@ -394,15 +390,19 @@ if __name__ == "__main__":
         elif args.shift_constants == "worst":
             objective_values_finite = objective_values[~objective_values.isinf().any(dim=1)]
             shift_constants[:] = torch.maximum(shift_constants, objective_values_finite.max(dim=0).values)
-        elif args.shift_constants == "mean":
-            shift_constants[:] = objective_values[~objective_values.isinf().any(dim=1)].mean(dim=0)
-        
+        elif args.shift_constants == "batch_best":                
+            shift_constants[:] = objective_values.min(dim=0).values
+        elif args.shift_constants == "batch_worst":
+            objective_values_finite = objective_values[~objective_values.isinf().any(dim=1)]
+            shift_constants[:] = objective_values_finite.max(dim=0).values
+        elif args.shift_constants == "batch_mean":
+            objective_values_finite = objective_values[~objective_values.isinf().any(dim=1)]
+            shift_constants[:] = objective_values_finite.mean(dim=0)
+
         select_indices = []
         select_lig_mask = []
         select_pocket_mask = []
-        global lambda_
-        if args.refresh_lambda:
-            lambda_ = get_lambda(batch_size, num_objectives, args.lambda_mode, device)            
+
         objective_values_candidates = objective_values.clone()
         for i in range(batch_size):
             lambda_i = lambda_[i, :]
@@ -445,6 +445,7 @@ if __name__ == "__main__":
 
     # [objective_values] lower is better
     raw_metrics, objective_values = objective_fn(molecules)
+
     evaluated_molecules = [
         EvaluatedMolecule(mol, obj_values, raw_metric)
         for mol, obj_values, raw_metric in zip(molecules, objective_values, raw_metrics)

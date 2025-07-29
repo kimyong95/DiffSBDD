@@ -8,6 +8,7 @@ from rdkit.Chem import AllChem
 from pymoo.indicators.hv import HV
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from objective import METRIC_MAXIMIZE
+import math
 
 class EvaluatedMolecule:
     def __init__(self, molecule: Chem.Mol, objective_values: torch.Tensor, raw_metrics: Dict[str, float]):
@@ -144,3 +145,140 @@ def log_molecules_objective_values(evaluated_molecules: List[EvaluatedMolecule],
         log_dict[f"{stage}/{metric}_mean"] = metric_tensor.mean()
         log_dict[f"{stage}/{metric}_best"] = metric_tensor.max() if METRIC_MAXIMIZE[metric] else metric_tensor.min()
     wandb.log(log_dict, commit=commit)
+
+
+
+def get_frac(x):
+    """
+    Calculates the fractional part of a number.
+    """
+    return x - np.floor(x)
+
+def is_prime(num):
+    """
+    Checks if a number is prime.
+    """
+    if num < 2:
+        return False
+    for i in range(2, int(math.sqrt(num)) + 1):
+        if num % i == 0:
+            return False
+    return True
+
+def find_next_prime(num):
+    """
+    Finds the smallest prime number greater than or equal to the given number.
+    """
+    prime_candidate = num
+    while True:
+        if is_prime(prime_candidate):
+            return prime_candidate
+        prime_candidate += 1
+
+# From paper: [Relationships between Decomposition-based MOEAs and Indicator-based MOEAs], Algorithm 6
+def generate_weight_vectors(N, n):
+    """
+    Implements Algorithm 6 from the paper to generate weight vectors.
+
+    Args:
+        N (int): The number of weight vectors to generate.
+        n (int): The dimension of the objective space.
+
+    Returns:
+        numpy.ndarray: A set of weight vectors W. Note the potential for
+                       dimension mismatch due to bugs in the source algorithm.
+    """
+    # --- Step 1: Find the smallest prime number p ---
+    # Find the smallest prime number p that satisfies p >= 2*(n-1)+1
+    p = find_next_prime(2 * (n - 1) + 1)
+    print(f"Step 1: Using prime number p = {p}")
+
+    # --- Step 2: Construct the generating vector z ---
+    # The paper's notation {x} is interpreted as the fractional part (x mod 1),
+    # and [x] is interpreted as rounding to the nearest integer.
+    z = np.zeros(n - 1)
+    z[0] = 1
+    for i in range(1, n - 2 + 1): # Corresponds to indices 1 to n-2 in paper
+        expr = 2 * np.cos(2 * np.pi * i / p)
+        # The paper's notation is ambiguous. We interpret [N * {expr}] as
+        # rounding (N times the fractional part of expr).
+        fractional_part = get_frac(expr)
+        z[i] = np.round(N * fractional_part)
+    print(f"Step 2: Generating vector z = {z}")
+
+    # --- Step 3-5: Generate N points T in the (n-1) dimensional unit cube ---
+    T = np.zeros((N, n - 1))
+    for j in range(1, N + 1):
+        # T_j = {(j * z) / N}, where {...} is the fractional part.
+        # This can be calculated efficiently using the modulo operator.
+        T[j-1, :] = get_frac(j * z / N)
+    print(f"Step 3-5: Generated T matrix of shape {T.shape}")
+
+
+    # --- Step 6-9: Project T into subspaces Theta and X ---
+    q = math.ceil((n - 1) / 2)
+    # Theta corresponds to the first q columns of T
+    Theta = T[:, 0:q]
+    # X corresponds to the remaining columns
+    X = T[:, q:n-1]
+    # Scale Theta
+    Theta = (np.pi / 2) * Theta
+    print(f"Step 6-9: Created Theta (shape {Theta.shape}) and X (shape {X.shape})")
+
+    # --- Step 10: Define k ---
+    k = math.floor(n / 2)
+    print(f"Step 10: k = {k}")
+
+    # --- Step 11-31: Construct Weight Vectors W ---
+
+    if n % 2 == 0:
+        # --- Even n case ---
+        print("Executing odd n case...")
+        # Initialize W. NOTE: The algorithm only seems to fill n-1 components.
+        
+        
+        Y = np.zeros((k+1, N))
+        Y[0,:] = 0
+        Y[k,:] = 1
+
+        W = np.zeros((n, N))
+
+        for i in range(k-1, 0, -1):
+            Y[i] = Y[i+1] * (X[:,i-1] ** (1 / i))
+
+        # Loop for i = 1 to k
+        for i in range(1, k + 1):
+            # W_{2i-1} = sqrt(Y_i - Y_{i-1}) * cos(Theta_i)
+            # W_{2i}   = sqrt(Y_i - Y_{i-1}) * sin(Theta_i)
+            # Python indices: W[:, 2*i-2], W[:, 2*i-1], Theta[:, i-1]
+            term = np.sqrt(Y[i] - Y[i - 1])
+            W[2 * i - 2] = term * np.cos(Theta[:, i - 1])
+            W[2 * i - 1] = term * np.sin(Theta[:, i - 1])
+
+    else:
+        # --- Odd n case ---
+
+        Y = np.zeros((k+1, N))
+        Y[k,:] = 1
+
+        W = np.zeros((n, N))
+
+        # Loop for i = k down to 1
+        for i in range(k, 0, -1):
+            # Y_i = Y_{i+1} * X_{i,:}^{2/(2i-1)}
+            # Paper uses 1-based indexing for X. X_{i,:} -> X[:, i-1]
+            Y[i-1] = Y[i] * (X[:, i - 1] ** (2 / (2 * i - 1)))
+
+        W[0] = np.sqrt(Y[0])
+
+        # Loop for i = 1 to k
+        for i in range(1, k + 1):
+            # W_{2i}   = sqrt(Y_{i+1} - Y_i) * cos(Theta_i)
+            # W_{2i+1} = sqrt(Y_{i+1} - Y_i) * sin(Theta_i)
+            # Python indices: W[:, 2*i-1], W[:, 2*i], Theta[:, i-1]
+            term = np.sqrt(Y[i] - Y[i-1])
+            W[2 * i - 1] = term * np.cos(Theta[:, i - 1])
+            W[2 * i]     = term * np.sin(Theta[:, i - 1])
+
+    # --- Step 32: Return W ---
+    return W
