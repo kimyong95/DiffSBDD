@@ -262,10 +262,14 @@ if __name__ == "__main__":
     seed = args.seed
     seed_everything(seed)
 
+    if args.lambda_mode == "deterministic_uniform":
+        lambda_mode_str = "du"
+    else:
+        lambda_mode_str = args.lambda_mode
 
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-c={args.shift_constants}-l={args.lambda_mode}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
+        name=f"sample-and-select-c={args.shift_constants}-ag={args.aggre_mode}-l={lambda_mode_str}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
         config=args,
     )
 
