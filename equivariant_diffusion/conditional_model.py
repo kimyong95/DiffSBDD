@@ -420,30 +420,26 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         # This will discard the second half batch of the z_lig, they are just the placeholder for the offspring
         if crossover:
-            half_batch = len(torch.unique(ligand['mask'], return_counts=True)[1]) // 2
-            assert len(z_lig) % 2 == 0, "Batch size must be even for crossover."
+            batch_size = len(torch.unique(ligand['mask'], return_counts=True)[1])
+            assert batch_size % 2 == 0, "Batch size must be even for crossover."
+            half_batch = batch_size // 2
             assert torch.all(ligand['mask'][ligand['mask'] < half_batch] == (ligand['mask'][ligand['mask'] >= half_batch] - half_batch)).item(), "First half and second half should have same number of atoms."
 
-            ligand_mask_parent = ligand['mask'][ligand['mask'] < half_batch]
-            z_lig_parent = z_lig[len(ligand_mask_parent):]
-            unbatch_z_lig_parent = torch.stack(utils.batch_to_list(z_lig_parent, ligand_mask_parent))
+            ligand_mask_half = ligand['mask'][ligand['mask'] < half_batch]
+            z_lig_parent = z_lig[:len(ligand_mask_half)]
+            unbatch_z_lig_parent = torch.stack(utils.batch_to_list(z_lig_parent, ligand_mask_half))
 
-            pocket_mask_parent = pocket['mask'][pocket['mask'] < half_batch]
-            pocket_mask_offspring = pocket_mask_parent + half_batch
-            xh_pocket_offspring = xh_pocket[len(pocket_mask_offspring):]
-            
             # Crossover
             z_lig_offspring = self.crossover(unbatch_z_lig_parent)
             z_lig_offspring = einops.rearrange(z_lig_offspring, 'b n d -> (b n) d')
-
-            z_lig_offspring[:,:3], xh_pocket_offspring[:,:3] = self.remove_mean_batch(
-                z_lig_offspring[:,:3], xh_pocket_offspring[:,:3],
-                ligand_mask_parent, pocket_mask_parent
-            )
             
-            # Family = Parent + Offspring
-            z_lig = torch.cat([z_lig_parent, z_lig_offspring], dim=0)
+            # Replace the second half of the z_lig with the offspring
+            z_lig[len(ligand_mask_half):] = z_lig_offspring
 
+            z_lig[:,:3], xh_pocket[:,:3] = self.remove_mean_batch(
+                z_lig[:,:3], xh_pocket[:,:3],
+                ligand['mask'], pocket['mask']
+            )
 
         timesteps = self.T
         n_samples = len(pocket['size'])
