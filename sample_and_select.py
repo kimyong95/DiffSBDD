@@ -21,6 +21,7 @@ import numpy as np
 from typing import List
 from utils_moo import EvaluatedMolecule, log_molecules_objective_values, generate_weight_vectors
 from rdkit import Chem
+from optimize_moo_ea import spea2
 
 from rdkit.Chem import AllChem
 from scipy.stats import qmc
@@ -249,14 +250,15 @@ if __name__ == "__main__":
     parser.add_argument('--ref_ligand', type=str, default='example/5ndu_C_8V2.sdf')
     parser.add_argument('--relax', action='store_true')
     parser.add_argument('--objective', type=str, default="sa;qed;vina")
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--sub_batch_size', type=int, default=4, help="Sub-batch size for sampling, should be smaller than batch_size.") 
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--sub_batch_size', type=int, default=2, help="Sub-batch size for sampling, should be smaller than batch_size.") 
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--shift_constants', type=str, default="worst")
     parser.add_argument('--lambda_mode', type=str, default="l2")
     parser.add_argument('--aggre_mode', type=str, default="neglogsumexp")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
+    parser.add_argument('--callback_interval', type=int, default=30, help="Interval of steps to call the callback function during sampling.")
 
     args = parser.parse_args()
     seed = args.seed
@@ -267,9 +269,14 @@ if __name__ == "__main__":
     else:
         lambda_mode_str = args.lambda_mode
 
+    if args.ea_optimize_steps > 0:
+        ea_str = "-ea"
+    else:
+        ea_str = ""
+
     run = wandb.init(
         project=f"sbdd-multi-objective",
-        name=f"sample-and-select-c={args.shift_constants}-ag={args.aggre_mode}-l={lambda_mode_str}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
+        name=f"sample-and-select{ea_str}-c={args.shift_constants}-ag={args.aggre_mode}-l={lambda_mode_str}-b={args.batch_size}:{args.sub_batch_size}-o={args.objective}-s={seed}",
         config=args,
     )
 
@@ -435,26 +442,74 @@ if __name__ == "__main__":
 
         return {"z_lig": selected_zs_lig, "xh_pocket": selected_xh_pocket_s}
 
-    with torch.inference_mode():
-        molecules = model.generate_ligands(
-            args.pdbfile, batch_size, None, args.ref_ligand, ref_ligand,
-            num_nodes_lig, sanitize=False, largest_frag=False,
-            relax_iter=(200 if args.relax else 0),
-            diversify_from_timestep=args.diversify_from_timestep,
-            callback=callback_func,
+    if ea_optimize_steps == 0:
+        with torch.inference_mode():
+            molecules = model.generate_ligands(
+                args.pdbfile, batch_size, None, args.ref_ligand, ref_ligand,
+                num_nodes_lig, sanitize=False, largest_frag=False,
+                relax_iter=(200 if args.relax else 0),
+                diversify_from_timestep=args.diversify_from_timestep,
+                callback=callback_func,
+            )
+        assert len(molecules) == batch_size
+
+        # [objective_values] lower is better
+        raw_metrics, objective_values = objective_fn(molecules)
+
+        evaluated_molecules = [
+            EvaluatedMolecule(mol, obj_values, raw_metric)
+            for mol, obj_values, raw_metric in zip(molecules, objective_values, raw_metrics)
+        ]
+        
+        log_molecules_objective_values(
+            evaluated_molecules, 
+            objectives_feedbacks=objective_fn.objectives_consumption,
+            stage=f"final",
         )
-    assert len(molecules) == batch_size
+    else:
+        # Ported from optimize_moo_ea.py
+        ref_mol = Chem.SDMolSupplier(args.ref_ligand)[0]
+        ref_metric, ref_objective_value = objective_fn([ref_mol])
+        buffer = [
+            EvaluatedMolecule(ref_mol, ref_objective_value[0], ref_metric[0])
+        ] * batch_size
+        
+        for generation_idx in range(ea_optimize_steps):
 
-    # [objective_values] lower is better
-    raw_metrics, objective_values = objective_fn(molecules)
+            # 1. Diversify molecules from the buffer
+            molecules_to_diversify = [buffer_item.molecule for buffer_item in buffer]
+            
+            with torch.inference_mode():
+                # Ensure the [molecules_to_diversify] is sorted from the best to the worst, the crossover will replace the 2nd half to the 1st half's offspring
+                ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
+                diversified_molecules = model.generate_ligands(
+                    pdb_file=args.pdbfile,
+                    ref_ligand_path=args.ref_ligand,
+                    ref_ligand=ligands_to_diversify,
+                    n_samples=len(molecules_to_diversify),
+                    diversify_from_timestep=args.diversify_from_timestep,
+                    sanitize=False,
+                    relax_iter=(200 if args.relax else 0),
+                    largest_frag=False,
+                    crossover=True,
+                    callback=callback_func if (generation_idx+1) % args.callback_interval == 0 else None,
+                )
 
-    evaluated_molecules = [
-        EvaluatedMolecule(mol, obj_values, raw_metric)
-        for mol, obj_values, raw_metric in zip(molecules, objective_values, raw_metrics)
-    ]
-    
-    log_molecules_objective_values(
-        evaluated_molecules, 
-        objectives_feedbacks=objective_fn.objectives_consumption,
-        stage=f"final",
-    )
+            # 2. Evaluate, select, and update buffer
+            raw_metrics, objective_values = objective_fn(diversified_molecules)
+
+            candicates = [
+                EvaluatedMolecule(mol, obj_values, raw_metric)
+                for mol, obj_values, raw_metric in zip(diversified_molecules, objective_values, raw_metrics)
+            ]
+
+            log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="candidates", commit=False)
+
+
+            # 3. Union with family, and select best molecules based on the objective values
+            buffer.extend(candicates)
+            fitness = spea2(torch.stack([c.objective_values for c in buffer]))
+            sorted_indices = torch.argsort(fitness, descending=False)
+            buffer = [buffer[i] for i in sorted_indices[:batch_size]]
+
+            log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="population", commit=True)

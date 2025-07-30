@@ -182,12 +182,12 @@ if __name__ == "__main__":
     parser.add_argument('--ref_ligand', type=str, default='example/5ndu_C_8V2.sdf')
     parser.add_argument('--objective', type=str, default="sa;qed;vina")
     parser.add_argument('--timesteps', type=int, default=100)
-    parser.add_argument('--population_size', type=int, default=32)
+    parser.add_argument('--population_size', type=int, default=64)
     parser.add_argument('--evolution_steps', type=int, default=1000)
     parser.add_argument('--outfile', type=Path, default='output.sdf')
     parser.add_argument('--relax', action='store_true')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--mode', type=str, default='egd', choices=['egd', 'sbdd-ea'])
+    parser.add_argument('--mode', type=str, default='egd', choices=['egd', 'sbdd-ea-mean', 'sbdd-ea-spea2'])
     parser.add_argument('--sbdd_top_k', type=int, default=4)
 
     args = parser.parse_args()
@@ -238,34 +238,19 @@ if __name__ == "__main__":
         molecules_to_diversify = [buffer_item.molecule for buffer_item in buffer]
         
         with torch.inference_mode():
-            if args.mode == 'egd':
-                # Crossover will double the batch size
-                molecules_to_diversify = molecules_to_diversify + molecules_to_diversify
-                ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
-                diversified_molecules = model.generate_ligands(
-                    pdb_file=args.pdbfile,
-                    ref_ligand_path=args.ref_ligand,
-                    ref_ligand=ligands_to_diversify,
-                    n_samples=len(molecules_to_diversify),
-                    diversify_from_timestep=args.timesteps,
-                    sanitize=False,
-                    relax_iter=(200 if args.relax else 0),
-                    largest_frag=False,
-                    crossover=True
-                )
-            elif args.mode == 'sbdd-ea':
-                ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
-                diversified_molecules = model.generate_ligands(
-                    pdb_file=args.pdbfile,
-                    ref_ligand_path=args.ref_ligand,
-                    ref_ligand=ligands_to_diversify,
-                    n_samples=len(molecules_to_diversify),
-                    diversify_from_timestep=args.timesteps,
-                    sanitize=False,
-                    relax_iter=(200 if args.relax else 0),
-                    largest_frag=False,
-                    crossover=False
-                )
+            # Ensure the [molecules_to_diversify] is sorted from the best to the worst, the crossover will replace the 2nd half to the 1st half's offspring
+            ligands_to_diversify = utils.prepare_ligands_from_mols(molecules_to_diversify, model.lig_type_encoder, device=model.device)
+            diversified_molecules = model.generate_ligands(
+                pdb_file=args.pdbfile,
+                ref_ligand_path=args.ref_ligand,
+                ref_ligand=ligands_to_diversify,
+                n_samples=len(molecules_to_diversify),
+                diversify_from_timestep=args.timesteps,
+                sanitize=False,
+                relax_iter=(200 if args.relax else 0),
+                largest_frag=False,
+                crossover=bool(args.mode == 'egd')
+            )
         
         # 2. Evaluate, select, and update buffer
         raw_metrics, objective_values = objective_fn(diversified_molecules)
@@ -283,11 +268,20 @@ if __name__ == "__main__":
             fitness = spea2(torch.stack([c.objective_values for c in buffer]))
             sorted_indices = torch.argsort(fitness, descending=False)
             buffer = [buffer[i] for i in sorted_indices[:population_size]]
-        elif args.mode == 'sbdd-ea':
+        elif args.mode == 'sbdd-ea-mean':
             # 3. Drop the parents
             buffer = candicates
             aggregated_objective_values = torch.stack([c.objective_values for c in buffer]).mean(dim=1)
-            sorted_indices = torch.argsort(fitness, descending=False)
+            sorted_indices = torch.argsort(aggregated_objective_values, descending=False)
+            buffer = [buffer[i] for i in sorted_indices[:sbdd_top_k]]
+            while len(buffer) < population_size:
+                buffer.extend(buffer)
+            buffer = buffer[:population_size]
+        elif args.mode == 'sbdd-ea-spea2':
+            # 3. Drop the parents
+            buffer = candicates
+            aggregated_objective_values = spea2(torch.stack([c.objective_values for c in buffer]))
+            sorted_indices = torch.argsort(aggregated_objective_values, descending=False)
             buffer = [buffer[i] for i in sorted_indices[:sbdd_top_k]]
             while len(buffer) < population_size:
                 buffer.extend(buffer)
