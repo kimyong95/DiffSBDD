@@ -160,8 +160,8 @@ class ConditionalDDPM(EnVariationalDiffusion):
         xh_pocket = xh0_pocket.detach().clone()
         out_lig[:, :self.n_dims], xh_pocket[:, :self.n_dims] = \
             self.remove_mean_batch(out_lig[:, :self.n_dims],
-                                   xh0_pocket[:, :self.n_dims],
-                                   lig_mask, pocket_mask)
+                                    xh0_pocket[:, :self.n_dims],
+                                    lig_mask, pocket_mask)
 
         return out_lig, xh_pocket
 
@@ -418,19 +418,32 @@ class ConditionalDDPM(EnVariationalDiffusion):
 
         z_lig, xh_pocket, _ = self.partially_noised_ligand(ligand, pocket, noising_steps, given_noise=given_noise_list[0])
 
-        # This will discard the second half of the z_lig, they will be replaced by the offspring
+        # This will discard the second half batch of the z_lig, they are just the placeholder for the offspring
         if crossover:
-            z_lig_parent = z_lig[:len(z_lig)//2]
-            ligand_mask_parent = ligand['mask'][:len(z_lig)//2]
+            half_batch = len(torch.unique(ligand['mask'], return_counts=True)[1]) // 2
+            assert len(z_lig) % 2 == 0, "Batch size must be even for crossover."
+            assert torch.all(ligand['mask'][ligand['mask'] < half_batch] == (ligand['mask'][ligand['mask'] >= half_batch] - half_batch)).item(), "First half and second half should have same number of atoms."
 
+            ligand_mask_parent = ligand['mask'][ligand['mask'] < half_batch]
+            z_lig_parent = z_lig[len(ligand_mask_parent):]
+            unbatch_z_lig_parent = torch.stack(utils.batch_to_list(z_lig_parent, ligand_mask_parent))
+
+            pocket_mask_parent = pocket['mask'][pocket['mask'] < half_batch]
+            pocket_mask_offspring = pocket_mask_parent + half_batch
+            xh_pocket_offspring = xh_pocket[len(pocket_mask_offspring):]
+            
             # Crossover
-            z_lig_offspring = self.crossover(torch.stack(utils.batch_to_list(z_lig_parent, ligand_mask_parent)))
+            z_lig_offspring = self.crossover(unbatch_z_lig_parent)
             z_lig_offspring = einops.rearrange(z_lig_offspring, 'b n d -> (b n) d')
-            mean = scatter_mean(z_lig_offspring[:, :self.n_dims], ligand_mask_parent, dim=0)
-            z_lig_offspring[:, :self.n_dims] -= mean[ligand_mask_parent]
+
+            z_lig_offspring[:,:3], xh_pocket_offspring[:,:3] = self.remove_mean_batch(
+                z_lig_offspring[:,:3], xh_pocket_offspring[:,:3],
+                ligand_mask_parent, pocket_mask_parent
+            )
             
             # Family = Parent + Offspring
             z_lig = torch.cat([z_lig_parent, z_lig_offspring], dim=0)
+
 
         timesteps = self.T
         n_samples = len(pocket['size'])
@@ -595,12 +608,12 @@ class ConditionalDDPM(EnVariationalDiffusion):
             s_array = s_array / timesteps
             t_array = t_array / timesteps
 
+            xh_pocket_t = xh_pocket.detach().clone()
             z_lig, xh_pocket, mu_lig = self.sample_p_zs_given_zt(
                 s_array, t_array, z_lig, xh_pocket, lig_mask, pocket['mask'], given_noise=given_noise_list[i+1])
 
-            if callback is not None and s > 0:
-                next_s = s-1
-                callback_out = callback(mu_lig=mu_lig, s=next_s, lig_mask=lig_mask, pocket=pocket, xh_pocket=xh_pocket)
+            if callback is not None:
+                callback_out = callback(mu_ts_lig=mu_lig, xh_pocket_t=xh_pocket_t, s=s, lig_mask=lig_mask, pocket=pocket)
                 z_lig = callback_out["z_lig"] if "z_lig" in callback_out else z_lig
                 xh_pocket = callback_out["xh_pocket"] if "xh_pocket" in callback_out else xh_pocket
 

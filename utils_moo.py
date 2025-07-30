@@ -207,13 +207,16 @@ def generate_weight_vectors(N, n):
     print(f"Step 2: Generating vector z = {z}")
 
     # --- Step 3-5: Generate N points T in the (n-1) dimensional unit cube ---
-    T = np.zeros((N, n - 1))
+    T = np.zeros((N, n - 1))    
+
     for j in range(1, N + 1):
         # T_j = {(j * z) / N}, where {...} is the fractional part.
         # This can be calculated efficiently using the modulo operator.
         T[j-1, :] = get_frac(j * z / N)
     print(f"Step 3-5: Generated T matrix of shape {T.shape}")
 
+    U = np.random.rand(1, (n - 1))
+    T = np.remainder((T + U), 1)
 
     # --- Step 6-9: Project T into subspaces Theta and X ---
     q = math.ceil((n - 1) / 2)
