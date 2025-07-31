@@ -22,6 +22,7 @@ from rdkit.Chem.rdForceFieldHelpers import UFFGetMoleculeForceField
 from scipy.spatial.distance import jensenshannon
 from tqdm import tqdm
 from useful_rdkit_utils import REOS, RingSystemLookup, get_min_ring_frequency, RingSystemFinder
+import os
 
 from .interactions import INTERACTION_LIST, prepare_ligand, read_protein, profile_detailed
 from .sascorer import calculateScore
@@ -360,7 +361,8 @@ class GninaEvalulator(AbstractEvaluator):
         with tempfile.TemporaryDirectory() as tmpdir:
             molecule = self.save_molecule(molecule, sdf_path=Path(tmpdir, 'molecule.sdf'))
             vina_only_flag = "--cnn_scoring none" if self.vina_only else ""
-            gnina_cmd = f'{self.gnina} -r {str(protein)} -l {str(molecule)} --minimize --cpu 1 --seed 42 {vina_only_flag}'
+            _env = f'LD_LIBRARY_PATH={os.environ["CONDA_PREFIX"]}/lib:$LD_LIBRARY_PATH {self.gnina}'
+            gnina_cmd = f'{_env} -r {str(protein)} -l {str(molecule)} --minimize --cpu 1 --seed 42 {vina_only_flag}'
             gnina_result = subprocess.run(gnina_cmd, shell=True, capture_output=True, text=True)
             n_atoms = self.load_molecule(molecule).GetNumAtoms()
 
