@@ -425,20 +425,23 @@ class ConditionalDDPM(EnVariationalDiffusion):
             half_batch = batch_size // 2
             assert torch.all(ligand['mask'][ligand['mask'] < half_batch] == (ligand['mask'][ligand['mask'] >= half_batch] - half_batch)).item(), "First half and second half should have same number of atoms."
 
+            # Prepare masks
             ligand_mask_half = ligand['mask'][ligand['mask'] < half_batch]
+            pocket_mask_half = pocket['mask'][pocket['mask'] < half_batch]
+
+            # Crossover the first half of the z_lig
             z_lig_parent = z_lig[:len(ligand_mask_half)]
             unbatch_z_lig_parent = torch.stack(utils.batch_to_list(z_lig_parent, ligand_mask_half))
-
-            # Crossover
             z_lig_offspring = self.crossover(unbatch_z_lig_parent)
             z_lig_offspring = einops.rearrange(z_lig_offspring, 'b n d -> (b n) d')
             
             # Replace the second half of the z_lig with the offspring
             z_lig[len(ligand_mask_half):] = z_lig_offspring
 
-            z_lig[:,:3], xh_pocket[:,:3] = self.remove_mean_batch(
-                z_lig[:,:3], xh_pocket[:,:3],
-                ligand['mask'], pocket['mask']
+            # Center the offspring
+            z_lig[len(ligand_mask_half):,:3], xh_pocket[len(pocket_mask_half):,:3] = self.remove_mean_batch(
+                z_lig[len(ligand_mask_half):,:3], xh_pocket[len(pocket_mask_half):,:3],
+                ligand_mask_half, pocket_mask_half
             )
 
         timesteps = self.T
