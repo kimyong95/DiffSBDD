@@ -122,7 +122,7 @@ def get_num_pareto_front(objective_values):
     return len(nds.do(objective_values.cpu().numpy())[0])
 
 
-def log_molecules_objective_values(evaluated_molecules: List[EvaluatedMolecule], objectives_feedbacks, stage, commit=True):
+def log_molecules_objective_values(evaluated_molecules: List[EvaluatedMolecule], objectives_feedbacks, stage, table=None, commit=True):
 
     buffer_molecules = [item.molecule for item in evaluated_molecules]
     buffer_objective_values = torch.stack([item.objective_values for item in evaluated_molecules])
@@ -132,6 +132,11 @@ def log_molecules_objective_values(evaluated_molecules: List[EvaluatedMolecule],
     molecules_diversity = calculate_molecules_diversity(buffer_molecules)
     hypervolume = calculate_hypervolume(buffer_objective_values)
     num_pareto_front = get_num_pareto_front(buffer_objective_values)
+
+    if table is not None:
+        for mol, objective_value in zip(buffer_molecules, buffer_objective_values):
+            table.add_data(objectives_feedbacks, Chem.MolToPDBBlock(mol), *objective_value.tolist())
+        wandb.log({"molecules_table": table})
 
     log_dict = {
         "objectives_feedbacks": objectives_feedbacks,

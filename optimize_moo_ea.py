@@ -202,6 +202,7 @@ if __name__ == "__main__":
         config=args,
     )
 
+
     pdb_id = Path(args.pdbfile).stem
 
     device = "cuda"
@@ -223,6 +224,8 @@ if __name__ == "__main__":
 
     metrics = args.objective.split(";")
     objective_fn = Objective(metrics, args.pocket_pdbfile)
+
+    table = wandb.Table(columns=["objectives_feedbacks", "molecule"]+metrics, log_mode="INCREMENTAL")
 
     ref_mol = Chem.SDMolSupplier(args.ref_ligand)[0]
 
@@ -287,4 +290,4 @@ if __name__ == "__main__":
                 buffer.extend(buffer)
             buffer = buffer[:population_size]
 
-        log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="population", commit=True)
+        log_molecules_objective_values(candicates, objectives_feedbacks=objective_fn.objectives_consumption, stage="population", table=table, commit=True)

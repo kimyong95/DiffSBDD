@@ -298,6 +298,8 @@ if __name__ == "__main__":
     num_objectives = len(metrics)
     objective_fn = Objective(metrics, args.pocket_pdbfile)
     
+    table = wandb.Table(columns=["objectives_feedbacks", "molecule"]+metrics, log_mode="INCREMENTAL")
+
     dimension = num_atoms * atom_dim
 
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -518,6 +520,7 @@ if __name__ == "__main__":
     log_molecules_objective_values(
         evaluated_molecules, 
         objectives_feedbacks=objective_fn.objectives_consumption,
+        table=table,
         stage=f"final",
     )
         
