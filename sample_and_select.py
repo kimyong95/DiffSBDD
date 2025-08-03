@@ -254,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument('--diversify_from_timestep', type=int, default=100, help="diversify the [ref_ligand], lower timestep means closer to [ref_ligand], set -1 for no diversify (no reference ligand used).")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--shift_constants', type=str, default="worst")
-    parser.add_argument('--lambda_mode', type=str, default="l2")
+    parser.add_argument('--lambda_mode', type=str, default="deterministic_uniform")
     parser.add_argument('--aggre_mode', type=str, default="neglogsumexp")
     parser.add_argument('--ea_optimize_steps', default=0, type=int, help="Number of steps to optimize using evolutionary algorithm. Set to 0 to disable.")
 
