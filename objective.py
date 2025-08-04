@@ -13,6 +13,7 @@ METRIC_RANGE = {
     "sa": (1.0, 10.0),
     "vina": (-12.0, 0.0),
     "gnina": (0, 10.0),
+    "reos": (0, 8.0)
 }
 
 class Objective:
@@ -71,6 +72,10 @@ class Objective:
         return raw_metrics, normalized_objective_values
 
     def preprocess_molecule(self, mol):
+
+        if mol is None:
+            return None
+
         try:
             Chem.SanitizeMol(mol)
         except ValueError as e:
