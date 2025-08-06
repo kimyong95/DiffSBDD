@@ -1,4 +1,3 @@
-
 # plot 3x4 grid for metric
 import matplotlib.pyplot as plt
 import numpy as np
@@ -248,3 +247,42 @@ legend = fig.legend(loc='lower center', ncol=6, bbox_to_anchor=(0.5, -0.6 / fig.
 plt.tight_layout()
 plt.savefig(f"{dir_path}/figure.jpeg", dpi=600, bbox_inches='tight', bbox_extra_artists=(legend,text_x,text_y), format='jpeg', pil_kwargs={"quality":93})
 
+
+# -------------------------- Ablation --------------------------
+
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+# Ablation on c
+c_values = [-1, -0.8, -0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6, 0.8, 1]
+hypervolumes_c = []
+for c in c_values:
+    run_name = f"sample-and-select-c={c}-ag=neglogsumexp-l=du-b=32:8-o=sa;qed;vina-s=0"
+    if run_name in wandb_cache:
+        history = wandb_cache[run_name]["history"]
+        hypervolumes_c.append(history["final/hypervolume"].values[-1])
+
+
+ax1.plot(c_values, hypervolumes_c, marker='o', color=colors[6])
+ax1.set_xlabel("Coefficient Parameter (c)")
+ax1.set_ylabel("Hypervolume")
+ax1.set_title("Ablation on Coefficient Parameter")
+ax1.grid(True)
+
+# Ablation on n
+n_values = [2, 4, 8, 16, 32]
+hypervolumes_n = []
+for n in n_values:
+    run_name = f"sample-and-select-c=worst-ag=neglogsumexp-l=du-b={n}:32-o=sa;qed;vina-s=0"
+    if run_name in wandb_cache:
+        history = wandb_cache[run_name]["history"]
+        hypervolumes_n.append(history["final/hypervolume"].values[-1])
+
+ax2.plot(n_values, hypervolumes_n, marker='o', color=colors[6])
+ax2.set_xlabel("Batch Size (N)")
+ax2.set_ylabel("Hypervolume")
+ax2.set_title("Ablation on Batch Size")
+ax2.grid(True)
+
+plt.tight_layout()
+plt.savefig(f"{dir_path}/ablation_figure.jpeg", dpi=600, format='jpeg', pil_kwargs={"quality":93})
