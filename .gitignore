@@ -1,2 +1,5 @@
 __pycache__/
 wandb
+cloud_functions_deployment
+result_moo/
+visualize/
